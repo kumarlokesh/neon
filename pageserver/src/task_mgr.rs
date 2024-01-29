@@ -104,6 +104,7 @@ use crate::shutdown_pageserver;
 // other operations, if the upload tasks e.g. get blocked on locks. It shouldn't
 // happen, but still.
 //
+#[cfg(not(test))]
 pub static COMPUTE_REQUEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("compute request worker")
@@ -112,6 +113,7 @@ pub static COMPUTE_REQUEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("Failed to create compute request runtime")
 });
 
+#[cfg(not(test))]
 pub static MGMT_REQUEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("mgmt request worker")
@@ -120,6 +122,7 @@ pub static MGMT_REQUEST_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("Failed to create mgmt request runtime")
 });
 
+#[cfg(not(test))]
 pub static WALRECEIVER_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("walreceiver worker")
@@ -128,6 +131,7 @@ pub static WALRECEIVER_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .expect("Failed to create walreceiver runtime")
 });
 
+#[cfg(not(test))]
 pub static BACKGROUND_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("background op worker")
