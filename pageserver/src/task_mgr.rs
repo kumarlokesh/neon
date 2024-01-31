@@ -130,7 +130,7 @@ use crate::shutdown_pageserver;
 // });
 
 pub static BACKGROUND_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
+    tokio::runtime::Builder::new_current_thread()
         .thread_name("background op worker")
         // if you change the number of worker threads please change the constant below
         .enable_all()
