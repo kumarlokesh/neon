@@ -141,7 +141,7 @@ impl Protocol {
             Protocol::Http => "http",
             Protocol::Ws => "ws",
             Protocol::Tcp => "tcp",
-            Protocol::SniRouter => "sni_router"
+            Protocol::SniRouter => "sni_router",
         }
     }
 }
@@ -299,7 +299,7 @@ pub struct ComputeConnectionLatencyGroup {
     protocol: Protocol,
     cache_miss: Bool,
     pool_miss: Bool,
-    outcome: Outcome,
+    outcome: ConnectOutcome,
 }
 
 #[derive(FixedCardinalityLabel)]
@@ -354,7 +354,7 @@ pub struct LatencyTimer {
     protocol: Protocol,
     cache_miss: bool,
     pool_miss: bool,
-    outcome: &'static str,
+    outcome: ConnectOutcome,
 }
 
 pub struct LatencyTimerPause<'a> {
@@ -371,7 +371,7 @@ impl LatencyTimer {
             // by default we don't do pooling
             pool_miss: true,
             // assume failed unless otherwise specified
-            outcome: "failed",
+            outcome: ConnectOutcome::Failed,
         }
     }
 
@@ -396,7 +396,7 @@ impl LatencyTimer {
         self.accumulated += start.elapsed();
 
         // success
-        self.outcome = "success";
+        self.outcome = ConnectOutcome::Success;
     }
 }
 
@@ -405,6 +405,12 @@ impl Drop for LatencyTimerPause<'_> {
         // start the stopwatch again
         self.timer.start = Some(time::Instant::now());
     }
+}
+
+#[derive(FixedCardinalityLabel, Clone, Copy, Debug)]
+enum ConnectOutcome {
+    Success,
+    Failed,
 }
 
 impl Drop for LatencyTimer {
@@ -419,11 +425,7 @@ impl Drop for LatencyTimer {
                     protocol: self.protocol,
                     cache_miss: self.cache_miss.into(),
                     pool_miss: self.pool_miss.into(),
-                    outcome: match self.outcome {
-                        "success" => Outcome::Success,
-                        "failure" => Outcome::Failure,
-                        _ => unreachable!(),
-                    },
+                    outcome: self.outcome,
                 },
                 duration.as_secs_f64(),
             )
@@ -437,14 +439,6 @@ impl From<bool> for Bool {
         } else {
             Bool::False
         }
-    }
-}
-
-pub const fn bool_to_str(x: bool) -> &'static str {
-    if x {
-        "true"
-    } else {
-        "false"
     }
 }
 
