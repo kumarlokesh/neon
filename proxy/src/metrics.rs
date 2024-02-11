@@ -4,7 +4,7 @@ use ::metrics::{register_hll_vec, HyperLogLogVec};
 use lasso::{Spur, ThreadedRodeo};
 use measured::{
     label::StaticLabelSet, metric::histogram::Thresholds, Counter, CounterVec,
-    FixedCardinalityLabel, Gauge, GaugeVec, LabelGroup, MetricGroup,
+    FixedCardinalityLabel, Gauge, GaugeVec, Histogram, HistogramVec, LabelGroup, MetricGroup,
 };
 
 use once_cell::sync::Lazy;
@@ -31,6 +31,7 @@ impl Metrics {
 }
 
 #[derive(MetricGroup)]
+#[metric(new())]
 pub struct ProxyMetrics {
     #[metric(flatten)]
     pub db_connections: NumDbConnectionsGauge,
@@ -40,77 +41,61 @@ pub struct ProxyMetrics {
     pub connection_requests: NumConnectionRequestsGauge,
     #[metric(flatten)]
     pub http_endpoint_pools: HttpEndpointPools,
+
     /// Time it took for proxy to establish a connection to the compute endpoint.
-    pub compute_connection_latency_seconds: measured::HistogramVec<ComputeConnectionLatencySet, 16>,
+    // largest bucket = 2^16 * 0.5ms = 32s
+    #[metric(init = HistogramVec::new(Thresholds::exponential_buckets(0.0005, 2.0)))]
+    pub compute_connection_latency_seconds: HistogramVec<ComputeConnectionLatencySet, 16>,
+
     /// Time it took for proxy to receive a response from control plane.
-    pub compute_console_request_latency: measured::HistogramVec<ConsoleRequestSet, 16>,
+    #[metric(init = HistogramVec::new_metric_vec(
+        ConsoleRequestSet {
+            request: ThreadedRodeo::with_hasher(BuildHasherDefault::default()),
+        },
+        // largest bucket = 2^16 * 0.2ms = 13s
+        Thresholds::exponential_buckets(0.0002, 2.0))
+    )]
+    pub compute_console_request_latency: HistogramVec<ConsoleRequestSet, 16>,
+
     /// Time it takes to acquire a token to call console plane.
-    pub control_plane_token_acquire_seconds: measured::Histogram<16>,
+    // largest bucket = 3^16 * 0.05ms = 2.15s
+    #[metric(init = Histogram::new_metric(Thresholds::exponential_buckets(0.00005, 3.0)))]
+    pub control_plane_token_acquire_seconds: Histogram<16>,
+
     /// Size of the HTTP request body lengths.
-    pub http_conn_content_length_bytes: measured::Histogram<20>,
+    // largest bucket = 2^20 * 8B = 8MiB
+    #[metric(init = Histogram::new_metric(Thresholds::exponential_buckets(8.0, 2.0)))]
+    pub http_conn_content_length_bytes: Histogram<20>,
+
     /// Time it takes to reclaim unused connection pools.
-    pub http_pool_reclaimation_lag_seconds: measured::Histogram<16>,
+    #[metric(init = Histogram::new_metric(Thresholds::exponential_buckets(0.0002, 2.0)))]
+    pub http_pool_reclaimation_lag_seconds: Histogram<16>,
+
     /// Number of opened connections to a database.
     pub http_pool_opened_connections: Gauge,
+
     /// Number of cache hits/misses for allowed ips.
     pub allowed_ips_cache_misses: CounterVec<StaticLabelSet<CacheOutcome>>,
+
     /// Number of allowed ips
-    pub allowed_ips_number: measured::Histogram<10>,
+    // largest bucket = 2^16 * 0.2ms = 13s
+    #[metric(init = Histogram::new_metric(Thresholds::exponential_buckets(0.0002, 2.0)))]
+    pub allowed_ips_number: Histogram<10>,
+
     /// Number of connections (per sni).
     pub accepted_connections_by_sni: CounterVec<StaticLabelSet<SniKind>>,
+
     /// Number of connection failures (per kind).
     pub connection_failures_total: CounterVec<StaticLabelSet<ConnectionFailureKind>>,
+
     /// Number of wake-up failures (per kind).
     pub connection_failures_breakdown: CounterVec<ConnectionFailuresBreakdownSet>,
+
     /// Number of bytes sent/received between all clients and backends.
     pub io_bytes: CounterVec<StaticLabelSet<Direction>>,
+
     /// Number of errors by a given classification.
     pub errors_total: CounterVec<StaticLabelSet<crate::error::ErrorKind>>,
-}
-
-impl ProxyMetrics {
-    pub fn new() -> Self {
-        Self {
-            db_connections: NumDbConnectionsGauge::default(),
-            client_connections: NumClientConnectionsGauge::default(),
-            connection_requests: NumConnectionRequestsGauge::default(),
-            http_endpoint_pools: HttpEndpointPools::default(),
-            compute_connection_latency_seconds: measured::HistogramVec::new_metric_vec(
-                ComputeConnectionLatencySet::default(),
-                // largest bucket = 2^16 * 0.5ms = 32s
-                Thresholds::exponential_buckets(0.0005, 2.0),
-            ),
-            compute_console_request_latency: measured::HistogramVec::new_metric_vec(
-                ConsoleRequestSet {
-                    request: ThreadedRodeo::with_hasher(BuildHasherDefault::default()),
-                },
-                // largest bucket = 2^16 * 0.2ms = 13s
-                Thresholds::exponential_buckets(0.0002, 2.0),
-            ),
-            // largest bucket = 2^16 * 0.2ms = 13s
-            control_plane_token_acquire_seconds: measured::Histogram::new_metric(
-                Thresholds::exponential_buckets(0.0002, 2.0),
-            ),
-            // largest bucket = 3^16 * 0.05ms = 2.15s
-            http_conn_content_length_bytes: measured::Histogram::new_metric(
-                Thresholds::exponential_buckets(8.0, 2.0),
-            ),
-            // 1us -> 65ms
-            http_pool_reclaimation_lag_seconds: measured::Histogram::new_metric(
-                Thresholds::exponential_buckets(1e-6, 2.0),
-            ),
-            http_pool_opened_connections: Gauge::new(),
-            allowed_ips_cache_misses: CounterVec::default(),
-            allowed_ips_number: measured::Histogram::new_metric(Thresholds::with_buckets([
-                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 50.0, 100.0,
-            ])),
-            accepted_connections_by_sni: CounterVec::default(),
-            connection_failures_total: CounterVec::default(),
-            connection_failures_breakdown: CounterVec::default(),
-            io_bytes: CounterVec::default(),
-            errors_total: CounterVec::default(),
-        }
-    }
 }
 
 impl Default for ProxyMetrics {
