@@ -1,13 +1,7 @@
 use anyhow::{anyhow, bail};
 use hyper::{header::CONTENT_TYPE, Body, Request, Response, StatusCode};
-use measured::{
-    metric::{
-        name::{MetricName, WithNamespace},
-        MetricFamilyEncoding,
-    },
-    text::TextEncoder,
-    Counter, MetricGroup,
-};
+use measured::{metric::name::WithNamespace, text::TextEncoder, MetricGroup};
+use metrics::LibMetrics;
 use routerify::{Middleware, Router};
 use std::{
     convert::Infallible,
@@ -28,11 +22,14 @@ async fn status_handler(_: Request<Body>) -> Result<Response<Body>, ApiError> {
     json_response(StatusCode::OK, "")
 }
 
-fn make_router(jemalloc: Option<jemalloc::MetricRecorder>) -> RouterBuilder<hyper::Body, ApiError> {
+fn make_router(
+    libmetrics: LibMetrics,
+    jemalloc: Option<jemalloc::MetricRecorder>,
+) -> RouterBuilder<hyper::Body, ApiError> {
     let state = Arc::new(Mutex::new(PrometheusHandler {
         encoder: TextEncoder::new(),
         jemalloc,
-        serve_count: Counter::new(),
+        libmetrics,
     }));
 
     Router::builder()
@@ -50,13 +47,14 @@ fn make_router(jemalloc: Option<jemalloc::MetricRecorder>) -> RouterBuilder<hype
 
 pub async fn task_main(
     http_listener: TcpListener,
+    libmetrics: LibMetrics,
     jemalloc: Option<jemalloc::MetricRecorder>,
 ) -> anyhow::Result<Infallible> {
     scopeguard::defer! {
         info!("http has shut down");
     }
 
-    let service = || RouterService::new(make_router(jemalloc).build()?);
+    let service = || RouterService::new(make_router(libmetrics, jemalloc).build()?);
 
     hyper::Server::from_tcp(http_listener)?
         .serve(service().map_err(|e| anyhow!(e))?)
@@ -67,9 +65,9 @@ pub async fn task_main(
 
 struct PrometheusHandler {
     encoder: TextEncoder,
+
     jemalloc: Option<jemalloc::MetricRecorder>,
-    /// Number of metric requests made
-    serve_count: Counter,
+    libmetrics: LibMetrics,
 }
 
 async fn prometheus_metrics_handler(
@@ -86,18 +84,13 @@ async fn prometheus_metrics_handler(
         let PrometheusHandler {
             encoder,
             jemalloc,
-            serve_count,
+            libmetrics,
         } = &mut *state;
-        serve_count.inc_mut();
 
-        const SERVE_COUNT: &MetricName =
-            MetricName::from_static("libmetrics_metric_handler_requests_total");
-        serve_count.collect_into(SERVE_COUNT, &mut *encoder);
-
+        WithNamespace::new("libmetrics", &*libmetrics).collect_into(&mut *encoder);
         if let Some(jemalloc) = &jemalloc {
             WithNamespace::new("jemalloc", jemalloc).collect_into(&mut *encoder);
         }
-
         crate::metrics::Metrics::get().collect_into(&mut *encoder);
 
         let body = encoder.finish();
