@@ -988,6 +988,13 @@ impl Timeline {
             .await
         {
             Ok((partitioning, lsn)) => {
+                tracing::info!("compact: repartitioned.  Partitions:");
+                for part in &partitioning.parts {
+                    tracing::info!("  Partition ranges:");
+                    for range in &part.ranges {
+                        tracing::info!("    {range:?}");
+                    }
+                }
                 // Disables access_stats updates, so that the files we read remain candidates for eviction after we're done with them
                 let image_ctx = RequestContextBuilder::extend(ctx)
                     .access_stats_behavior(AccessStatsBehavior::Skip)
@@ -3163,7 +3170,7 @@ impl Timeline {
             }
         }
         let keyspace = self.collect_keyspace(lsn, ctx).await?;
-        let partitioning = keyspace.partition(partition_size);
+        let partitioning = keyspace.partition(&self.shard_identity, partition_size);
 
         let mut partitioning_guard = self.partitioning.lock().unwrap();
         if lsn > partitioning_guard.1 {
@@ -3274,6 +3281,7 @@ impl Timeline {
 
         for partition in partitioning.parts.iter() {
             let img_range = start..partition.ranges.last().unwrap().end;
+
             if force || self.time_for_new_image_layer(partition, lsn).await {
                 let mut image_layer_writer = ImageLayerWriter::new(
                     self.conf,
