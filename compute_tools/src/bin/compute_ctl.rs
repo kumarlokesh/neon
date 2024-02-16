@@ -44,7 +44,7 @@ use std::{thread, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::Arg;
+use clap::{Arg, ArgAction};
 use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use tracing::{error, info};
@@ -56,7 +56,6 @@ use compute_tools::compute::{
     forward_termination_signal, ComputeNode, ComputeState, ParsedSpec, PG_PID,
 };
 use compute_tools::configurator::launch_configurator;
-use compute_tools::extension_server::get_pg_version;
 use compute_tools::http::api::launch_http_server;
 use compute_tools::logger::*;
 use compute_tools::monitor::launch_monitor;
@@ -83,8 +82,12 @@ fn main() -> Result<()> {
     info!("build_tag: {build_tag}");
 
     let matches = cli().get_matches();
-    let pgbin_default = String::from("postgres");
-    let pgbin = matches.get_one::<String>("pgbin").unwrap_or(&pgbin_default);
+    let pgroot = matches
+        .get_one::<String>("pgroot")
+        .expect("pgroot is required");
+    let pgversion = matches
+        .get_one::<String>("pgversion")
+        .expect("pgversion is required");
 
     let ext_remote_storage = matches
         .get_one::<String>("remote-ext-config")
@@ -110,6 +113,7 @@ fn main() -> Result<()> {
         .expect("Postgres connection string is required");
     let spec_json = matches.get_one::<String>("spec");
     let spec_path = matches.get_one::<String>("spec-path");
+    let no_postgres = matches.get_one::<bool>("no-postgres");
 
     // Extract OpenTelemetry context for the startup actions from the
     // TRACEPARENT and TRACESTATE env variables, and attach it to the current
@@ -213,8 +217,8 @@ fn main() -> Result<()> {
     let compute_node = ComputeNode {
         connstr: Url::parse(connstr).context("cannot parse connstr as a URL")?,
         pgdata: pgdata.to_string(),
-        pgbin: pgbin.to_string(),
-        pgversion: get_pg_version(pgbin),
+        pgroot: pgroot.to_string(),
+        pgversion: pgversion.to_string(),
         live_config_allowed,
         state: Mutex::new(new_state),
         state_changed: Condvar::new(),
@@ -467,11 +471,15 @@ fn cli() -> clap::Command {
                 .required(true),
         )
         .arg(
-            Arg::new("pgbin")
-                .short('b')
-                .long("pgbin")
-                .default_value("postgres")
-                .value_name("POSTGRES_PATH"),
+            Arg::new("pgroot")
+                .short('R')
+                .long("pgroot")
+                .value_name("POSTGRES_ROOT"),
+        )
+        .arg(
+            Arg::new("pgversion")
+                .long("pgversion")
+                .value_name("POSTGRES_VERSION"),
         )
         .arg(
             Arg::new("spec")
@@ -525,6 +533,11 @@ fn cli() -> clap::Command {
                     "host=localhost port=5432 dbname=postgres user=cloud_admin sslmode=disable",
                 )
                 .value_name("FILECACHE_CONNSTR"),
+        )
+        .arg(
+            Arg::new("no-postgres")
+                .long("no-postgres")
+                .action(ArgAction::SetTrue),
         )
 }
 

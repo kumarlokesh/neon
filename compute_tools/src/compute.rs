@@ -4,6 +4,7 @@ use std::fs;
 use std::io::BufRead;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
@@ -47,7 +48,7 @@ pub struct ComputeNode {
     // Url type maintains proper escaping
     pub connstr: url::Url,
     pub pgdata: String,
-    pub pgbin: String,
+    pub pgroot: String,
     pub pgversion: String,
     /// We should only allow live re- / configuration of the compute node if
     /// it uses 'pull model', i.e. it can go to control-plane and fetch
@@ -319,6 +320,35 @@ impl ComputeNode {
         Ok(())
     }
 
+    /// Get path pointing to requested binary directory.
+    pub fn get_pg_bindir(&self, version: &str) -> PathBuf {
+        Path::new(&self.pgroot)
+            .join(format!("v{}", version))
+            .join("bin")
+    }
+
+    /// Get path to requested Postgres binary.
+    pub fn get_pg_binary(&self, version: &str, binary: &str) -> String {
+        self.get_pg_bindir(version)
+            .join(binary)
+            .into_os_string()
+            .into_string()
+            .expect(&format!(
+                "path to {}-{} cannot be represented as UTF-8",
+                binary, version
+            ))
+    }
+
+    /// Get path to Postgres binary directory of this compute.
+    pub fn get_my_pg_bindir(&self) -> PathBuf {
+        self.get_pg_bindir(&self.pgversion)
+    }
+
+    /// Get path to specified Postgres binary of this compute.
+    pub fn get_my_pg_binary(&self, binary: &str) -> String {
+        self.get_pg_binary(&self.pgversion, binary)
+    }
+
     // Get basebackup from the libpq connection to pageserver using `connstr` and
     // unarchive it to `pgdata` directory overriding all its previous content.
     #[instrument(skip_all, fields(%lsn))]
@@ -524,7 +554,8 @@ impl ComputeNode {
     pub fn sync_safekeepers(&self, storage_auth_token: Option<String>) -> Result<Lsn> {
         let start_time = Utc::now();
 
-        let mut sync_handle = maybe_cgexec(&self.pgbin)
+        let postgres = self.get_my_pg_binary("postgres");
+        let mut sync_handle = maybe_cgexec(&postgres)
             .args(["--sync-safekeepers"])
             .env("PGDATA", &self.pgdata) // we cannot use -D in this mode
             .envs(if let Some(storage_auth_token) = &storage_auth_token {
@@ -621,6 +652,10 @@ impl ComputeNode {
                 info!("Initializing standby from latest Pageserver LSN");
                 Lsn(0)
             }
+            ComputeMode::Upgrade => {
+                info!("Starting upgrade node at latest Pageserver LSN");
+                Lsn(0)
+            }
         };
 
         info!(
@@ -680,7 +715,7 @@ impl ComputeNode {
         symlink("/dev/shm/", pgdata_path.join("pg_dynshmem"))?;
 
         match spec.mode {
-            ComputeMode::Primary => {}
+            ComputeMode::Primary | ComputeMode::Upgrade => {}
             ComputeMode::Replica | ComputeMode::Static(..) => {
                 add_standby_signal(pgdata_path)?;
             }
@@ -699,7 +734,7 @@ impl ComputeNode {
 
         // Run initdb to completion
         info!("running initdb");
-        let initdb_bin = Path::new(&self.pgbin).parent().unwrap().join("initdb");
+        let initdb_bin = self.get_my_pg_binary("initdb");
         Command::new(initdb_bin)
             .args(["-D", pgdata])
             .output()
@@ -715,7 +750,8 @@ impl ComputeNode {
 
         // Start postgres
         info!("starting postgres");
-        let mut pg = maybe_cgexec(&self.pgbin)
+        let postgres = self.get_my_pg_binary("postgres");
+        let mut pg = maybe_cgexec(&postgres)
             .args(["-D", pgdata])
             .spawn()
             .expect("cannot start postgres process");
@@ -744,7 +780,8 @@ impl ComputeNode {
         let pgdata_path = Path::new(&self.pgdata);
 
         // Run postgres as a child process.
-        let mut pg = maybe_cgexec(&self.pgbin)
+        let postgres = self.get_my_pg_binary("postgres");
+        let mut pg = maybe_cgexec(&postgres)
             .args(["-D", &self.pgdata])
             .envs(if let Some(storage_auth_token) = &storage_auth_token {
                 vec![("NEON_AUTH_TOKEN", storage_auth_token)]
@@ -836,8 +873,8 @@ impl ComputeNode {
     // have opened connection to Postgres and superuser access.
     #[instrument(skip_all)]
     fn pg_reload_conf(&self) -> Result<()> {
-        let pgctl_bin = Path::new(&self.pgbin).parent().unwrap().join("pg_ctl");
-        Command::new(pgctl_bin)
+        let pgctl_bin = self.get_my_pg_binary("pg_ctl");
+        Command::new(&pgctl_bin)
             .args(["reload", "-D", &self.pgdata])
             .output()
             .expect("cannot run pg_ctl process");
@@ -920,12 +957,76 @@ impl ComputeNode {
         Ok(())
     }
 
+    /// Prepares the compute for Postgres operations, including downloading
+    /// remote extensions and preparing the pgdata directory.
+    ///
+    /// The caller must hold the state mutex.
+    #[instrument(skip_all)]
+    pub fn prepare_compute(
+        &self,
+        state: &mut ComputeState,
+        extension_server_port: u16,
+    ) -> Result<()> {
+        let pspec = state.pspec.as_ref().expect("spec must be set");
+
+        info!(
+            "preparing compute for project {}, operation {}, tenant {}, timeline {}",
+            pspec.spec.cluster.cluster_id.as_deref().unwrap_or("None"),
+            pspec.spec.operation_uuid.as_deref().unwrap_or("None"),
+            pspec.tenant_id,
+            pspec.timeline_id,
+        );
+
+        info!(
+            "prepare_compute spec.remote_extensions {:?}",
+            pspec.spec.remote_extensions
+        );
+
+        // This part is sync, because we need to download
+        // remote shared_preload_libraries before postgres start (if any)
+        if let Some(remote_extensions) = &pspec.spec.remote_extensions {
+            // First, create control files for all availale extensions
+            let postgres_bin = self.get_my_pg_binary("postgres");
+            extension_server::create_control_files(remote_extensions, &postgres_bin);
+
+            let library_load_start_time = Utc::now();
+            let remote_ext_metrics = self.prepare_preload_libraries(&pspec.spec)?;
+
+            let library_load_time = Utc::now()
+                .signed_duration_since(library_load_start_time)
+                .to_std()
+                .unwrap()
+                .as_millis() as u64;
+            let mut state = self.state.lock().unwrap();
+            state.metrics.load_ext_ms = library_load_time;
+            state.metrics.num_ext_downloaded = remote_ext_metrics.num_ext_downloaded;
+            state.metrics.largest_ext_size = remote_ext_metrics.largest_ext_size;
+            state.metrics.total_ext_download_size = remote_ext_metrics.total_ext_download_size;
+            info!(
+                "Loading shared_preload_libraries took {:?}ms",
+                library_load_time
+            );
+            info!("{:?}", remote_ext_metrics);
+        }
+
+        self.prepare_pgdata(&state, extension_server_port)?;
+
+        // Equivalent of ComputeNode::set_status(), but we hold the lock.
+        state.status = ComputeStatus::Prepared;
+        self.state_changed.notify_all();
+
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     pub fn start_compute(
         &self,
         extension_server_port: u16,
     ) -> Result<(std::process::Child, std::thread::JoinHandle<()>)> {
-        let compute_state = self.state.lock().unwrap().clone();
+        let mut compute_state = self.state.lock().unwrap().clone();
+
+        self.prepare_compute(&mut compute_state, extension_server_port)?;
+
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         info!(
             "starting compute for project {}, operation {}, tenant {}, timeline {}",
@@ -954,39 +1055,6 @@ impl ComputeNode {
                 }
             });
         }
-
-        info!(
-            "start_compute spec.remote_extensions {:?}",
-            pspec.spec.remote_extensions
-        );
-
-        // This part is sync, because we need to download
-        // remote shared_preload_libraries before postgres start (if any)
-        if let Some(remote_extensions) = &pspec.spec.remote_extensions {
-            // First, create control files for all availale extensions
-            extension_server::create_control_files(remote_extensions, &self.pgbin);
-
-            let library_load_start_time = Utc::now();
-            let remote_ext_metrics = self.prepare_preload_libraries(&pspec.spec)?;
-
-            let library_load_time = Utc::now()
-                .signed_duration_since(library_load_start_time)
-                .to_std()
-                .unwrap()
-                .as_millis() as u64;
-            let mut state = self.state.lock().unwrap();
-            state.metrics.load_ext_ms = library_load_time;
-            state.metrics.num_ext_downloaded = remote_ext_metrics.num_ext_downloaded;
-            state.metrics.largest_ext_size = remote_ext_metrics.largest_ext_size;
-            state.metrics.total_ext_download_size = remote_ext_metrics.total_ext_download_size;
-            info!(
-                "Loading shared_preload_libraries took {:?}ms",
-                library_load_time
-            );
-            info!("{:?}", remote_ext_metrics);
-        }
-
-        self.prepare_pgdata(&compute_state, extension_server_port)?;
 
         let start_time = Utc::now();
         let pg_process = self.start_postgres(pspec.storage_auth_token.clone())?;
@@ -1084,9 +1152,11 @@ impl ComputeNode {
                 core_path.display()
             );
 
+            let postgres_bin = self.get_my_pg_binary("postgres");
+
             // Try first with gdb
             let backtrace = Command::new("gdb")
-                .args(["--batch", "-q", "-ex", "bt", &self.pgbin])
+                .args(["--batch", "-q", "-ex", "bt", &postgres_bin])
                 .arg(&core_path)
                 .output();
 
@@ -1219,11 +1289,12 @@ LIMIT 100",
         // then we try to download it here
         info!("downloading new extension {ext_archive_name}");
 
+        let postgres_bin = self.get_my_pg_binary("postgres");
         let download_size = extension_server::download_extension(
             &real_ext_name,
             &ext_path,
             ext_remote_storage,
-            &self.pgbin,
+            &postgres_bin,
         )
         .await
         .map_err(DownloadError::Other);
