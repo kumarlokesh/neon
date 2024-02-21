@@ -374,10 +374,7 @@ mod tests {
         let endpoint_id = "endpoint".into();
         let user1: RoleName = "user1".into();
         let user2: RoleName = "user2".into();
-        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user1.as_str(),
-            [1; 32],
-        )));
+        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock([1; 32])));
         let secret2 = None;
         let allowed_ips = Arc::new(vec![
             "127.0.0.1".parse().unwrap(),
@@ -396,10 +393,7 @@ mod tests {
 
         // Shouldn't add more than 2 roles.
         let user3: RoleName = "user3".into();
-        let secret3 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user3.as_str(),
-            [3; 32],
-        )));
+        let secret3 = Some(AuthSecret::Scram(ServerSecret::mock([3; 32])));
         cache.insert_role_secret(&project_id, &endpoint_id, &user3, secret3.clone());
         assert!(cache.get_role_secret(&endpoint_id, &user3).is_none());
 
@@ -432,14 +426,8 @@ mod tests {
         let endpoint_id = "endpoint".into();
         let user1: RoleName = "user1".into();
         let user2: RoleName = "user2".into();
-        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user1.as_str(),
-            [1; 32],
-        )));
-        let secret2 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user2.as_str(),
-            [2; 32],
-        )));
+        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock([1; 32])));
+        let secret2 = Some(AuthSecret::Scram(ServerSecret::mock([2; 32])));
         let allowed_ips = Arc::new(vec![
             "127.0.0.1".parse().unwrap(),
             "127.0.0.2".parse().unwrap(),
@@ -487,14 +475,8 @@ mod tests {
         let endpoint_id = "endpoint".into();
         let user1: RoleName = "user1".into();
         let user2: RoleName = "user2".into();
-        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user1.as_str(),
-            [1; 32],
-        )));
-        let secret2 = Some(AuthSecret::Scram(ServerSecret::mock(
-            user2.as_str(),
-            [2; 32],
-        )));
+        let secret1 = Some(AuthSecret::Scram(ServerSecret::mock([1; 32])));
+        let secret2 = Some(AuthSecret::Scram(ServerSecret::mock([2; 32])));
         let allowed_ips = Arc::new(vec![
             "127.0.0.1".parse().unwrap(),
             "127.0.0.2".parse().unwrap(),

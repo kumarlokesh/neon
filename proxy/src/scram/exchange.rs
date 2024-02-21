@@ -158,6 +158,11 @@ impl SaslSentInner {
         let client_final_message = ClientFinalMessage::parse(input)
             .ok_or(SaslError::BadClientMessage("invalid client-final-message"))?;
 
+        // don't waste CPU cycles if we are doomed
+        if secret.doomed {
+            return Ok(sasl::Step::Failure("password doesn't match"));
+        }
+
         let channel_binding = cbind_flag.encode(|_| match tls_server_end_point {
             config::TlsServerEndPoint::Sha256(x) => Ok(x),
             config::TlsServerEndPoint::Undefined => Err(SaslError::MissingBinding),
@@ -185,7 +190,7 @@ impl SaslSentInner {
             .derive_client_key(&client_final_message.proof);
 
         // Auth fails either if keys don't match or it's pre-determined to fail.
-        if client_key.sha256() != secret.stored_key || secret.doomed {
+        if client_key.sha256() != secret.stored_key {
             return Ok(sasl::Step::Failure("password doesn't match"));
         }
 

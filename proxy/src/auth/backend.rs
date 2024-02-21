@@ -230,7 +230,7 @@ async fn auth_quirks(
                 // prevent malicious probing (possible due to missing protocol steps).
                 // This mocked secret will never lead to successful authentication.
                 warn!("rate limiting authentication, mocking it");
-                AuthSecret::Scram(scram::ServerSecret::mock(&info.user, rand::random()))
+                AuthSecret::Scram(scram::ServerSecret::mock(rand::random()))
             }
         }
         None => {
@@ -238,7 +238,7 @@ async fn auth_quirks(
             // prevent malicious probing (possible due to missing protocol steps).
             // This mocked secret will never lead to successful authentication.
             info!("authentication info not found, mocking it");
-            AuthSecret::Scram(scram::ServerSecret::mock(&info.user, rand::random()))
+            AuthSecret::Scram(scram::ServerSecret::mock(rand::random()))
         }
     };
 
