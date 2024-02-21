@@ -20,6 +20,7 @@ use tokio::time::error::Elapsed;
 use crate::{
     console,
     error::{ReportableError, UserFacingError},
+    EndpointId,
 };
 use std::io;
 use thiserror::Error;
@@ -55,7 +56,7 @@ pub enum AuthErrorImpl {
     MissingEndpointName,
 
     #[error("password authentication failed for user '{0}'")]
-    AuthFailed(Box<str>),
+    AuthFailed(Box<str>, EndpointId),
 
     /// Errors produced by e.g. [`crate::stream::PqStream`].
     #[error(transparent)]
@@ -83,8 +84,8 @@ impl AuthError {
         AuthErrorImpl::BadAuthMethod(name.into()).into()
     }
 
-    pub fn auth_failed(user: impl Into<Box<str>>) -> Self {
-        AuthErrorImpl::AuthFailed(user.into()).into()
+    pub fn auth_failed(user: impl Into<Box<str>>, endpoint: EndpointId) -> Self {
+        AuthErrorImpl::AuthFailed(user.into(), endpoint).into()
     }
 
     pub fn ip_address_not_allowed() -> Self {
@@ -95,8 +96,11 @@ impl AuthError {
         AuthErrorImpl::TooManyConnections.into()
     }
 
-    pub fn is_auth_failed(&self) -> bool {
-        matches!(self.0.as_ref(), AuthErrorImpl::AuthFailed(_))
+    pub fn is_auth_failed(&self) -> Option<&EndpointId> {
+        match self.0.as_ref() {
+            AuthErrorImpl::AuthFailed(_, s) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn user_timeout(elapsed: Elapsed) -> Self {
@@ -117,7 +121,7 @@ impl UserFacingError for AuthError {
             Link(e) => e.to_string_client(),
             GetAuthInfo(e) => e.to_string_client(),
             Sasl(e) => e.to_string_client(),
-            AuthFailed(_) => self.to_string(),
+            AuthFailed(_, _) => self.to_string(),
             BadAuthMethod(_) => self.to_string(),
             MalformedPassword(_) => self.to_string(),
             MissingEndpointName => self.to_string(),
@@ -136,7 +140,7 @@ impl ReportableError for AuthError {
             Link(e) => e.get_error_kind(),
             GetAuthInfo(e) => e.get_error_kind(),
             Sasl(e) => e.get_error_kind(),
-            AuthFailed(_) => crate::error::ErrorKind::User,
+            AuthFailed(_, _) => crate::error::ErrorKind::User,
             BadAuthMethod(_) => crate::error::ErrorKind::User,
             MalformedPassword(_) => crate::error::ErrorKind::User,
             MissingEndpointName => crate::error::ErrorKind::User,

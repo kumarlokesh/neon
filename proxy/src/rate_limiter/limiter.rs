@@ -1,6 +1,7 @@
 use std::{
     collections::hash_map::RandomState,
-    hash::BuildHasher,
+    hash::{BuildHasher, Hash},
+    net::IpAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -8,14 +9,17 @@ use std::{
 };
 
 use anyhow::bail;
-use dashmap::DashMap;
+use dashmap::{
+    mapref::{entry::Entry, one::RefMut},
+    DashMap,
+};
 use itertools::Itertools;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, SemaphorePermit};
 use tokio::time::{timeout, Duration, Instant};
 use tracing::info;
 
-use crate::EndpointId;
+use crate::{intern::EndpointIdInt, EndpointId};
 
 use super::{
     limit_algorithm::{LimitAlgorithm, Sample},
@@ -71,8 +75,13 @@ impl RedisRateLimiter {
 // saw SNI, before doing TLS handshake. User-side error messages in that case
 // does not look very nice (`SSL SYSCALL error: Undefined error: 0`), so for now
 // I went with a more expensive way that yields user-friendlier error messages.
-pub struct EndpointRateLimiter<Rand = StdRng, Hasher = RandomState> {
-    map: DashMap<EndpointId, Vec<RateBucket>, Hasher>,
+pub type EndpointRateLimiter = BucketRateLimiter<EndpointId, StdRng, RandomState>;
+
+// This can't be just per IP because that would limit some PaaS that share IP addresses
+pub type AuthRateLimiter = BucketRateLimiter<(EndpointIdInt, IpAddr), StdRng, RandomState>;
+
+pub struct BucketRateLimiter<Key, Rand = StdRng, Hasher = RandomState> {
+    map: DashMap<Key, Vec<RateBucket>, Hasher>,
     info: &'static [RateBucketInfo],
     access_count: AtomicUsize,
     rand: Mutex<Rand>,
@@ -136,10 +145,16 @@ impl std::str::FromStr for RateBucketInfo {
 }
 
 impl RateBucketInfo {
-    pub const DEFAULT_SET: [Self; 3] = [
+    pub const DEFAULT_ENDPOINT_SET: [Self; 3] = [
         Self::new(300, Duration::from_secs(1)),
         Self::new(200, Duration::from_secs(60)),
         Self::new(100, Duration::from_secs(600)),
+    ];
+    /// very aggressive defaults for wrong passwords
+    pub const DEFAULT_AUTH_SET: [Self; 3] = [
+        Self::new(5, Duration::from_secs(1)),
+        Self::new(2, Duration::from_secs(60)),
+        Self::new(1, Duration::from_secs(600)),
     ];
 
     pub fn validate(info: &mut [Self]) -> anyhow::Result<()> {
@@ -150,7 +165,7 @@ impl RateBucketInfo {
             .find(|(a, b)| a.max_rpi > b.max_rpi);
         if let Some((a, b)) = invalid {
             bail!(
-                "invalid endpoint RPS limits. {b} allows fewer requests per bucket than {a} ({} vs {})",
+                "invalid bucket RPS limits. {b} allows fewer requests per bucket than {a} ({} vs {})",
                 b.max_rpi,
                 a.max_rpi,
             );
@@ -167,13 +182,13 @@ impl RateBucketInfo {
     }
 }
 
-impl EndpointRateLimiter {
+impl<K: Hash + Eq> BucketRateLimiter<K> {
     pub fn new(info: &'static [RateBucketInfo]) -> Self {
         Self::new_with_rand_and_hasher(info, StdRng::from_entropy(), RandomState::new())
     }
 }
 
-impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
+impl<K: Hash + Eq, R: Rng, S: BuildHasher + Clone> BucketRateLimiter<K, R, S> {
     fn new_with_rand_and_hasher(info: &'static [RateBucketInfo], rand: R, hasher: S) -> Self {
         info!(buckets = ?info, "endpoint rate limiter");
         Self {
@@ -185,7 +200,7 @@ impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
     }
 
     /// Check that number of connections to the endpoint is below `max_rps` rps.
-    pub fn check(&self, endpoint: EndpointId) -> bool {
+    pub fn try_acquire(&self, key: K) -> bool {
         // do a partial GC every 2k requests. This cleans up ~ 1/64th of the map.
         // worst case memory usage is about:
         //    = 2 * 2048 * 64 * (48B + 72B)
@@ -195,7 +210,42 @@ impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
         }
 
         let now = Instant::now();
-        let mut entry = self.map.entry(endpoint).or_insert_with(|| {
+        let mut entry = self.entry(key, now);
+
+        let should_allow_request = check(&mut entry, self.info, now);
+
+        if should_allow_request {
+            count(&mut entry);
+        }
+
+        should_allow_request
+    }
+
+    /// Check that number of connections to the endpoint is below `max_rps` rps.
+    pub fn check(&self, key: K) -> bool {
+        // do a partial GC every 2k requests. This cleans up ~ 1/64th of the map.
+        // worst case memory usage is about:
+        //    = 2 * 2048 * 64 * (48B + 72B)
+        //    = 30MB
+        if self.access_count.fetch_add(1, Ordering::AcqRel) % 2048 == 0 {
+            self.do_gc();
+        }
+
+        let now = Instant::now();
+        if let Entry::Occupied(mut entry) = self.map.entry(key) {
+            check(entry.get_mut(), self.info, now)
+        } else {
+            true
+        }
+    }
+
+    /// Acquire the token
+    pub fn count(&self, key: K) {
+        count(&mut self.entry(key, Instant::now()));
+    }
+
+    fn entry(&self, key: K, now: Instant) -> RefMut<'_, K, Vec<RateBucket>, S> {
+        self.map.entry(key).or_insert_with(|| {
             vec![
                 RateBucket {
                     start: now,
@@ -203,19 +253,7 @@ impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
                 };
                 self.info.len()
             ]
-        });
-
-        let should_allow_request = entry
-            .iter_mut()
-            .zip(self.info)
-            .all(|(bucket, info)| bucket.should_allow_request(info, now));
-
-        if should_allow_request {
-            // only increment the bucket counts if the request will actually be accepted
-            entry.iter_mut().for_each(RateBucket::inc);
-        }
-
-        should_allow_request
+        })
     }
 
     /// Clean the map. Simple strategy: remove all entries in a random shard.
@@ -223,7 +261,7 @@ impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
     /// But that way deletion does not aquire mutex on each entry access.
     pub fn do_gc(&self) {
         info!(
-            "cleaning up endpoint rate limiter, current size = {}",
+            "cleaning up bucket rate limiter, current size = {}",
             self.map.len()
         );
         let n = self.map.shards().len();
@@ -232,6 +270,17 @@ impl<R: Rng, S: BuildHasher + Clone> EndpointRateLimiter<R, S> {
         let shard = self.rand.lock().unwrap().gen_range(0..n);
         self.map.shards()[shard].write().clear();
     }
+}
+
+fn check(entry: &mut [RateBucket], info: &[RateBucketInfo], now: Instant) -> bool {
+    entry
+        .iter_mut()
+        .zip(info)
+        .all(|(bucket, info)| bucket.should_allow_request(info, now))
+}
+
+fn count(entry: &mut [RateBucket]) {
+    entry.iter_mut().for_each(RateBucket::inc);
 }
 
 /// Limits the number of concurrent jobs.
@@ -534,7 +583,7 @@ mod tests {
     use rustc_hash::FxHasher;
     use tokio::time;
 
-    use super::{EndpointRateLimiter, Limiter, Outcome};
+    use super::{BucketRateLimiter, EndpointRateLimiter, Limiter, Outcome};
     use crate::{
         rate_limiter::{RateBucketInfo, RateLimitAlgorithm},
         EndpointId,
@@ -672,7 +721,7 @@ mod tests {
 
     #[test]
     fn default_rate_buckets() {
-        let mut defaults = RateBucketInfo::DEFAULT_SET;
+        let mut defaults = RateBucketInfo::DEFAULT_ENDPOINT_SET;
         RateBucketInfo::validate(&mut defaults[..]).unwrap();
     }
 
@@ -700,35 +749,35 @@ mod tests {
         time::pause();
 
         for _ in 0..100 {
-            assert!(limiter.check(endpoint.clone()));
+            assert!(limiter.try_acquire(endpoint.clone()));
         }
         // more connections fail
-        assert!(!limiter.check(endpoint.clone()));
+        assert!(!limiter.try_acquire(endpoint.clone()));
 
         // fail even after 500ms as it's in the same bucket
         time::advance(time::Duration::from_millis(500)).await;
-        assert!(!limiter.check(endpoint.clone()));
+        assert!(!limiter.try_acquire(endpoint.clone()));
 
         // after a full 1s, 100 requests are allowed again
         time::advance(time::Duration::from_millis(500)).await;
         for _ in 1..6 {
             for _ in 0..100 {
-                assert!(limiter.check(endpoint.clone()));
+                assert!(limiter.try_acquire(endpoint.clone()));
             }
             time::advance(time::Duration::from_millis(1000)).await;
         }
 
         // more connections after 600 will exceed the 20rps@30s limit
-        assert!(!limiter.check(endpoint.clone()));
+        assert!(!limiter.try_acquire(endpoint.clone()));
 
         // will still fail before the 30 second limit
         time::advance(time::Duration::from_millis(30_000 - 6_000 - 1)).await;
-        assert!(!limiter.check(endpoint.clone()));
+        assert!(!limiter.try_acquire(endpoint.clone()));
 
         // after the full 30 seconds, 100 requests are allowed again
         time::advance(time::Duration::from_millis(1)).await;
         for _ in 0..100 {
-            assert!(limiter.check(endpoint.clone()));
+            assert!(limiter.try_acquire(endpoint.clone()));
         }
     }
 
@@ -738,13 +787,13 @@ mod tests {
         let rand = rand::rngs::StdRng::from_seed([1; 32]);
         let hasher = BuildHasherDefault::<FxHasher>::default();
 
-        let limiter = EndpointRateLimiter::new_with_rand_and_hasher(
-            &RateBucketInfo::DEFAULT_SET,
+        let limiter = BucketRateLimiter::new_with_rand_and_hasher(
+            &RateBucketInfo::DEFAULT_ENDPOINT_SET,
             rand,
             hasher,
         );
         for i in 0..1_000_000 {
-            limiter.check(format!("{i}").into());
+            limiter.try_acquire(i);
         }
         assert!(limiter.map.len() < 150_000);
     }

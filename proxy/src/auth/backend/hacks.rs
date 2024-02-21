@@ -37,7 +37,7 @@ pub async fn authenticate_cleartext(
         sasl::Outcome::Success(key) => key,
         sasl::Outcome::Failure(reason) => {
             info!("auth backend failed with an error: {reason}");
-            return Err(auth::AuthError::auth_failed(&*info.user));
+            return Err(auth::AuthError::auth_failed(&*info.user, info.endpoint));
         }
     };
 

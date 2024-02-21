@@ -44,22 +44,21 @@ impl PoolingBackend {
             None => {
                 // If we don't have an authentication secret, for the http flow we can just return an error.
                 info!("authentication info not found");
-                return Err(AuthError::auth_failed(&*user_info.user));
+                return Err(AuthError::auth_failed(&*user_info.user, user_info.endpoint));
             }
         };
         let auth_outcome =
             crate::auth::validate_password_and_exchange(&conn_info.password, secret)?;
-        let res = match auth_outcome {
-            crate::sasl::Outcome::Success(key) => Ok(key),
+        match auth_outcome {
+            crate::sasl::Outcome::Success(key) => Ok(ComputeCredentials {
+                info: user_info,
+                keys: key,
+            }),
             crate::sasl::Outcome::Failure(reason) => {
                 info!("auth backend failed with an error: {reason}");
-                Err(AuthError::auth_failed(&*conn_info.user_info.user))
+                Err(AuthError::auth_failed(&*user_info.user, user_info.endpoint))
             }
-        };
-        res.map(|key| ComputeCredentials {
-            info: user_info,
-            keys: key,
-        })
+        }
     }
 
     // Wake up the destination if needed. Code here is a bit involved because

@@ -12,6 +12,7 @@ use crate::console::errors::GetAuthInfoError;
 use crate::console::provider::{CachedRoleSecret, ConsoleBackend};
 use crate::console::{AuthSecret, NodeInfo};
 use crate::context::RequestMonitoring;
+use crate::intern::EndpointIdInt;
 use crate::proxy::connect_compute::ComputeConnectBackend;
 use crate::proxy::NeonOptions;
 use crate::stream::Stream;
@@ -28,7 +29,7 @@ use crate::{
 use crate::{scram, EndpointCacheKey, EndpointId, RoleName};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Alternative to [`std::borrow::Cow`] but doesn't need `T: ToOwned` as we don't need that functionality
 pub enum MaybeOwned<'a, T> {
@@ -215,14 +216,32 @@ async fn auth_quirks(
         Some(secret) => secret,
         None => api.get_role_secret(ctx, &info).await?,
     };
+    let (cached_entry, secret) = cached_secret.take_value();
 
-    let secret = cached_secret.value.clone().unwrap_or_else(|| {
-        // If we don't have an authentication secret, we mock one to
-        // prevent malicious probing (possible due to missing protocol steps).
-        // This mocked secret will never lead to successful authentication.
-        info!("authentication info not found, mocking it");
-        AuthSecret::Scram(scram::ServerSecret::mock(&info.user, rand::random()))
-    });
+    let secret = match secret {
+        Some(secret) => {
+            // we have validated the endpoint exists, so let's intern it.
+            let endpoint = EndpointIdInt::from(&info.endpoint);
+
+            if config.rate_limiter.check((endpoint, ctx.peer_addr)) {
+                secret
+            } else {
+                // If we don't have an authentication secret, we mock one to
+                // prevent malicious probing (possible due to missing protocol steps).
+                // This mocked secret will never lead to successful authentication.
+                warn!("rate limiting authentication, mocking it");
+                AuthSecret::Scram(scram::ServerSecret::mock(&info.user, rand::random()))
+            }
+        }
+        None => {
+            // If we don't have an authentication secret, we mock one to
+            // prevent malicious probing (possible due to missing protocol steps).
+            // This mocked secret will never lead to successful authentication.
+            info!("authentication info not found, mocking it");
+            AuthSecret::Scram(scram::ServerSecret::mock(&info.user, rand::random()))
+        }
+    };
+
     match authenticate_with_secret(
         ctx,
         secret,
@@ -236,9 +255,14 @@ async fn auth_quirks(
     {
         Ok(keys) => Ok(keys),
         Err(e) => {
-            if e.is_auth_failed() {
+            if let Some(endpoint) = e.is_auth_failed() {
+                // count the failed attempt
+                if let Some(endpoint) = EndpointIdInt::get(endpoint) {
+                    config.rate_limiter.count((endpoint, ctx.peer_addr))
+                }
+
                 // The password could have been changed, so we invalidate the cache.
-                cached_secret.invalidate();
+                cached_entry.invalidate();
             }
             Err(e)
         }
@@ -260,7 +284,7 @@ async fn authenticate_with_secret(
             crate::sasl::Outcome::Success(key) => key,
             crate::sasl::Outcome::Failure(reason) => {
                 info!("auth backend failed with an error: {reason}");
-                return Err(auth::AuthError::auth_failed(&*info.user));
+                return Err(auth::AuthError::auth_failed(&*info.user, info.endpoint));
             }
         };
 

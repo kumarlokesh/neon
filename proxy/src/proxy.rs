@@ -279,7 +279,7 @@ pub async fn handle_client<S: AsyncRead + AsyncWrite + Unpin>(
 
     // check rate limit
     if let Some(ep) = user_info.get_endpoint() {
-        if !endpoint_rate_limiter.check(ep) {
+        if !endpoint_rate_limiter.try_acquire(ep) {
             return stream
                 .throw_error(auth::AuthError::too_many_connections())
                 .await?;
