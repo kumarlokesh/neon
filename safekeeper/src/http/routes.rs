@@ -47,6 +47,7 @@ use utils::{
 };
 
 use super::models::TimelineCreateRequest;
+use crate::send_wal::REPLICATION_PAUSED;
 
 #[derive(Debug, Serialize)]
 struct SafekeeperStatus {
@@ -254,6 +255,15 @@ async fn timeline_digest_handler(request: Request<Body>) -> Result<Response<Body
         .await
         .map_err(ApiError::InternalServerError)?;
     json_response(StatusCode::OK, response)
+}
+
+async fn set_pause_replication_handler(request: Request<Body>) -> Result<Response<Body>, ApiError>
+{
+    let value: bool = parse_request_param(&request, "value")?;
+    REPLICATION_PAUSED.store(value, std::sync::atomic::Ordering::SeqCst);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty()).map_err(|e| ApiError::InternalServerError(e.into()))?)
 }
 
 /// Download a file from the timeline directory.
@@ -558,6 +568,7 @@ pub fn make_router(conf: SafeKeeperConf) -> RouterBuilder<hyper::Body, ApiError>
         .get("/v1/tenant/:tenant_id/timeline/:timeline_id/digest", |r| {
             request_span(r, timeline_digest_handler)
         })
+        .post("/v1/set_pause_replication/:value", |r| request_span(r, set_pause_replication_handler))
 }
 
 #[cfg(test)]

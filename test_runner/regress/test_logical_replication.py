@@ -203,6 +203,30 @@ def test_obsolete_slot_drop(neon_simple_env: NeonEnv, vanilla_pg):
     wait_until(number_of_iterations=10, interval=2, func=partial(slot_removed, endpoint))
 
 
+def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg):
+    env = neon_simple_env
+
+    env.neon_cli.create_branch("init")
+    endpoint = env.endpoints.create_start("init")
+    for sk in env.safekeepers:
+        sk.pause()
+
+    cur = endpoint.connect().cursor()
+    cur.execute("create table t(a int)")
+    cur.execute("create publication pub for table t")
+    cur.execute("insert into t values (1)")
+
+    vanilla_pg.start()
+    vanilla_pg.safe_psql("create table t(a int)")
+    connstr = endpoint.connstr().replace("'", "''") 
+    vanilla_pg.safe_psql(f"create subscription sub1 connection '{connstr}' publication pub")
+    logical_replication_sync(vanilla_pg, endpoint)
+    endpoint.stop()
+    vanilla_pg.stop()
+    endpoint.start()
+    vanilla_pg.start()
+
+
 # Test compute start at LSN page of which starts with contrecord
 # https://github.com/neondatabase/neon/issues/5749
 def test_wal_page_boundary_start(neon_simple_env: NeonEnv, vanilla_pg):

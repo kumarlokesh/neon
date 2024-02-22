@@ -30,6 +30,7 @@ use tokio::sync::watch::Receiver;
 use tokio::time::timeout;
 use tracing::*;
 use utils::{bin_ser::BeSer, lsn::Lsn};
+use std::sync::atomic::AtomicBool;
 
 // See: https://www.postgresql.org/docs/13/protocol-replication.html
 const HOT_STANDBY_FEEDBACK_TAG_BYTE: u8 = b'h';
@@ -38,6 +39,8 @@ const STANDBY_STATUS_UPDATE_TAG_BYTE: u8 = b'r';
 const NEON_STATUS_UPDATE_TAG_BYTE: u8 = b'z';
 
 type FullTransactionId = u64;
+
+pub static REPLICATION_PAUSED : AtomicBool = AtomicBool::new(false);
 
 /// Hot standby feedback received from replica
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -702,6 +705,12 @@ async fn wait_for_lsn(
     client_term: Option<Term>,
     start_pos: Lsn,
 ) -> anyhow::Result<Option<Lsn>> {
+    if REPLICATION_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        std::thread::sleep(POLL_STATE_TIMEOUT);
+        return Ok(None)
+    }
+
     let res = timeout(POLL_STATE_TIMEOUT, async move {
         loop {
             let end_pos = rx.get();
