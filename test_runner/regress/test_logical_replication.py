@@ -208,23 +208,49 @@ def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg)
 
     env.neon_cli.create_branch("init")
     endpoint = env.endpoints.create_start("init")
-    for sk in env.safekeepers:
-        sk.pause()
+    sk = env.safekeepers[0]
 
-    cur = endpoint.connect().cursor()
-    cur.execute("create table t(a int)")
-    cur.execute("create publication pub for table t")
-    cur.execute("insert into t values (1)")
+    with endpoint.connect().cursor() as cur:
+        cur.execute("create table t(a int)")
+        cur.execute("create publication pub for table t")
+        cur.execute("insert into t values (1)")
 
     vanilla_pg.start()
     vanilla_pg.safe_psql("create table t(a int)")
-    connstr = endpoint.connstr().replace("'", "''") 
+    connstr = endpoint.connstr().replace("'", "''")
     vanilla_pg.safe_psql(f"create subscription sub1 connection '{connstr}' publication pub")
     logical_replication_sync(vanilla_pg, endpoint)
-    endpoint.stop()
     vanilla_pg.stop()
-    endpoint.start()
+
+    for sk in env.safekeepers:
+        sk_http = sk.http_client()
+        sk_http.configure_failpoints([("sk-pause-send", "return")])
+
+    with endpoint.connect().cursor() as cur:
+        cur.execute("insert into t values (2)")
+
+    endpoint.stop_and_destroy()
+    endpoint = env.endpoints.create_start("init")
+    with endpoint.connect().cursor() as cur:
+        cur.execute("select * from t")
+        res = [r[0] for r in cur.fetchall()]
+        assert res == [1, 2]
+
     vanilla_pg.start()
+    connstr = endpoint.connstr().replace("'", "''")
+    vanilla_pg.safe_psql(f"alter subscription sub1 connection '{connstr}'")
+
+    for _ in range(5):
+        time.sleep(0.5)
+        assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1]
+
+    for sk in env.safekeepers:
+        sk_http = sk.http_client()
+        sk_http.configure_failpoints([("sk-pause-send", "off")])
+
+    logical_replication_sync(vanilla_pg, endpoint)
+    assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1, 2]
+
 
 
 # Test compute start at LSN page of which starts with contrecord

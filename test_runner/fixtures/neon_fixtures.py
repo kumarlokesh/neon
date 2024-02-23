@@ -3486,7 +3486,6 @@ class Safekeeper:
     port: SafekeeperPort
     id: int
     running: bool = False
-    paused: bool = False
 
     def start(self, extra_opts: Optional[List[str]] = None) -> "Safekeeper":
         assert self.running is False
@@ -3514,18 +3513,6 @@ class Safekeeper:
         self.env.neon_cli.safekeeper_stop(self.id, immediate)
         self.running = False
         return self
-
-    def pause(self) -> "Safekeeper":
-        log.info("Pausing safekeeper {}".format(self.id))
-        assert not self.paused
-        self.http_client().set_pause_replication(True)
-        self.paused = True
-
-    def unpause(self) -> "Safekeeper":
-        log.info("Pausing safekeeper {}".format(self.id))
-        assert self.paused
-        self.http_client().set_pause_replication(False)
-        self.paused = False
 
     def append_logical_message(
         self, tenant_id: TenantId, timeline_id: TimelineId, request: Dict[str, Any]
@@ -3790,11 +3777,6 @@ class SafekeeperHttpClient(requests.Session):
                 (TenantId(match.group(1)), TimelineId(match.group(2)))
             ] = int(match.group(3))
         return metrics
-
-    def set_pause_replication(self, value: bool):
-        value_as_str = f"{value}".lower()
-        res = self.post(f"http://localhost:{self.port}/v1/set_pause_replication/{value_as_str}")
-        res.raise_for_status()
 
 
 class S3Scrubber:

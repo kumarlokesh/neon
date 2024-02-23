@@ -30,7 +30,6 @@ use tokio::sync::watch::Receiver;
 use tokio::time::timeout;
 use tracing::*;
 use utils::{bin_ser::BeSer, lsn::Lsn};
-use std::sync::atomic::AtomicBool;
 
 // See: https://www.postgresql.org/docs/13/protocol-replication.html
 const HOT_STANDBY_FEEDBACK_TAG_BYTE: u8 = b'h';
@@ -39,8 +38,6 @@ const STANDBY_STATUS_UPDATE_TAG_BYTE: u8 = b'r';
 const NEON_STATUS_UPDATE_TAG_BYTE: u8 = b'z';
 
 type FullTransactionId = u64;
-
-pub static REPLICATION_PAUSED : AtomicBool = AtomicBool::new(false);
 
 /// Hot standby feedback received from replica
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -514,6 +511,8 @@ struct WalSender<'a, IO> {
     send_buf: [u8; MAX_SEND_SIZE],
 }
 
+const POLL_STATE_TIMEOUT: Duration = Duration::from_secs(1);
+
 impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
     /// Send WAL until
     /// - an error occurs
@@ -592,14 +591,22 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
     async fn wait_wal(&mut self) -> Result<(), CopyStreamHandlerEnd> {
         loop {
             self.end_pos = self.end_watch.get();
-            if self.end_pos > self.start_pos {
-                // We have something to send.
+            let have_something_to_send = (|| {
+                fail::fail_point!(
+                    "sk-pause-send",
+                    self.appname.as_deref() != Some("pageserver"),
+                    |_| { false }
+                );
+                self.end_pos > self.start_pos
+            })();
+
+            if have_something_to_send {
                 trace!("got end_pos {:?}, streaming", self.end_pos);
                 return Ok(());
             }
 
             // Wait for WAL to appear, now self.end_pos == self.start_pos.
-            if let Some(lsn) = wait_for_lsn(&mut self.end_watch, self.term, self.start_pos).await? {
+            if let Some(lsn) = self.wait_for_lsn().await? {
                 self.end_pos = lsn;
                 trace!("got end_pos {:?}, streaming", self.end_pos);
                 return Ok(());
@@ -634,6 +641,50 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
                     request_reply: true,
                 }))
                 .await?;
+        }
+    }
+
+    /// Wait until we have available WAL > start_pos or timeout expires. Returns
+    /// - Ok(Some(end_pos)) if needed lsn is successfully observed;
+    /// - Ok(None) if timeout expired;
+    /// - Err in case of error -- only if 1) term changed while fetching in recovery
+    ///   mode 2) watch channel closed, which must never happen.
+    async fn wait_for_lsn(&mut self) -> anyhow::Result<Option<Lsn>> {
+        fail::fail_point!(
+            "sk-pause-send",
+            self.appname.as_deref() != Some("pageserver"),
+            |_| {
+                std::thread::sleep(POLL_STATE_TIMEOUT);
+                Ok(None)
+            }
+        );
+
+        let res = timeout(POLL_STATE_TIMEOUT, async move {
+            loop {
+                let end_pos = self.end_watch.get();
+                if end_pos > self.start_pos {
+                    return Ok(end_pos);
+                }
+                if let EndWatch::Flush(rx) = &self.end_watch {
+                    let curr_term = rx.borrow().term;
+                    if let Some(client_term) = self.term {
+                        if curr_term != client_term {
+                            bail!("term changed: requested {}, now {}", client_term, curr_term);
+                        }
+                    }
+                }
+                self.end_watch.changed().await?;
+            }
+        })
+        .await;
+
+        match res {
+            // success
+            Ok(Ok(commit_lsn)) => Ok(Some(commit_lsn)),
+            // error inside closure
+            Ok(Err(err)) => Err(err),
+            // timeout
+            Err(_) => Ok(None),
         }
     }
 }
@@ -690,53 +741,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReplyReader<IO> {
             _ => warn!("unexpected message {:?}", msg),
         }
         Ok(())
-    }
-}
-
-const POLL_STATE_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Wait until we have available WAL > start_pos or timeout expires. Returns
-/// - Ok(Some(end_pos)) if needed lsn is successfully observed;
-/// - Ok(None) if timeout expired;
-/// - Err in case of error -- only if 1) term changed while fetching in recovery
-///   mode 2) watch channel closed, which must never happen.
-async fn wait_for_lsn(
-    rx: &mut EndWatch,
-    client_term: Option<Term>,
-    start_pos: Lsn,
-) -> anyhow::Result<Option<Lsn>> {
-    if REPLICATION_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
-    {
-        std::thread::sleep(POLL_STATE_TIMEOUT);
-        return Ok(None)
-    }
-
-    let res = timeout(POLL_STATE_TIMEOUT, async move {
-        loop {
-            let end_pos = rx.get();
-            if end_pos > start_pos {
-                return Ok(end_pos);
-            }
-            if let EndWatch::Flush(rx) = rx {
-                let curr_term = rx.borrow().term;
-                if let Some(client_term) = client_term {
-                    if curr_term != client_term {
-                        bail!("term changed: requested {}, now {}", client_term, curr_term);
-                    }
-                }
-            }
-            rx.changed().await?;
-        }
-    })
-    .await;
-
-    match res {
-        // success
-        Ok(Ok(commit_lsn)) => Ok(Some(commit_lsn)),
-        // error inside closure
-        Ok(Err(err)) => Err(err),
-        // timeout
-        Err(_) => Ok(None),
     }
 }
 
