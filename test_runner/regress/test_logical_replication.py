@@ -258,7 +258,6 @@ def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg)
     assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1, 2]
 
 
-
 # Test compute start at LSN page of which starts with contrecord
 # https://github.com/neondatabase/neon/issues/5749
 def test_wal_page_boundary_start(neon_simple_env: NeonEnv, vanilla_pg):
