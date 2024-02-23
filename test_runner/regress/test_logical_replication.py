@@ -222,28 +222,34 @@ def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg)
     logical_replication_sync(vanilla_pg, endpoint)
     vanilla_pg.stop()
 
+    # Pause the safekeepers so that they can't send WAL (except to pageserver)
     for sk in env.safekeepers:
         sk_http = sk.http_client()
         sk_http.configure_failpoints([("sk-pause-send", "return")])
 
+    # Insert a 2
     with endpoint.connect().cursor() as cur:
         cur.execute("insert into t values (2)")
 
     endpoint.stop_and_destroy()
+
+    # This new endpoint should contain [1, 2], but it can't access WAL from safekeeper
     endpoint = env.endpoints.create_start("init")
     with endpoint.connect().cursor() as cur:
         cur.execute("select * from t")
         res = [r[0] for r in cur.fetchall()]
         assert res == [1, 2]
 
+    # Reconnect subscriber
     vanilla_pg.start()
     connstr = endpoint.connstr().replace("'", "''")
     vanilla_pg.safe_psql(f"alter subscription sub1 connection '{connstr}'")
 
-    for _ in range(5):
-        time.sleep(0.5)
-        assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1]
+    time.sleep(5)
+    # Make sure the 2 isn't replicated
+    assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1]
 
+    # Re-enable WAL download
     for sk in env.safekeepers:
         sk_http = sk.http_client()
         sk_http.configure_failpoints([("sk-pause-send", "off")])
