@@ -203,7 +203,8 @@ def test_obsolete_slot_drop(neon_simple_env: NeonEnv, vanilla_pg):
     wait_until(number_of_iterations=10, interval=2, func=partial(slot_removed, endpoint))
 
 
-def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg):
+# Tests that walsender correctly blocks until WAL is downloaded from safekeepers
+def test_lr_with_slow_safekeeper(neon_simple_env: NeonEnv, vanilla_pg):
     env = neon_simple_env
 
     env.neon_cli.create_branch("init")
@@ -256,6 +257,11 @@ def test_subscriber_before_safekeeper_sync(neon_simple_env: NeonEnv, vanilla_pg)
 
     logical_replication_sync(vanilla_pg, endpoint)
     assert [r[0] for r in vanilla_pg.safe_psql("select * from t")] == [1, 2]
+
+    log_path = vanilla_pg.pgdatadir / "pg.log"
+    with open(log_path, "r") as log_file:
+        logs = log_file.read()
+        assert "could not receive data from WAL stream" not in logs
 
 
 # Test compute start at LSN page of which starts with contrecord

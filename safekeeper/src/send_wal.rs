@@ -654,7 +654,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
             "sk-pause-send",
             self.appname.as_deref() != Some("pageserver"),
             |_| {
-                std::thread::sleep(POLL_STATE_TIMEOUT);
+                tokio::time::sleep(POLL_STATE_TIMEOUT);
                 Ok(None)
             }
         );
