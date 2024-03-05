@@ -804,11 +804,8 @@ impl LayerInner {
             tracing::info!(%reason, "downloading on-demand");
 
             let init_cancelled = scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
-            let permit = self.spawn_download_and_wait(timeline, permit).await?;
+            let res = self.download_init_and_wait(timeline, permit).await?;
             scopeguard::ScopeGuard::into_inner(init_cancelled);
-
-            let res = self.initialize_after_layer_is_on_disk(permit);
-
             Ok(res)
         }
         .instrument(tracing::info_span!("get_or_maybe_download", layer=%self))
@@ -842,11 +839,11 @@ impl LayerInner {
     }
 
     /// Actual download, at most one is executed at the time.
-    async fn spawn_download_and_wait(
+    async fn download_init_and_wait(
         self: &Arc<Self>,
         timeline: Arc<Timeline>,
         permit: heavier_once_cell::InitPermit,
-    ) -> Result<heavier_once_cell::InitPermit, DownloadError> {
+    ) -> Result<Arc<DownloadedLayer>, DownloadError> {
         debug_assert_current_span_has_tenant_and_timeline_id();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -882,12 +879,24 @@ impl LayerInner {
 
                 let result = match result {
                     Ok(size) => {
+                        match this.needs_download().await {
+                            Ok(Some(reason)) => panic!("post-condition failed: needs_download returned {reason:?}"),
+                            Ok(None) => { /* good */ },
+                            Err(e) => panic!("post-condition failed needs_download errored: {e:?}"),
+                        }
+
+                        tracing::info!(size=%self.desc.file_size, "on-demand download successful");
                         timeline.metrics.resident_physical_size_add(size);
-                        Ok(())
+                        this.consecutive_failures.store(0, Ordering::Relaxed);
+
+                        let res = this.initialize_after_layer_is_on_disk(permit);
+                        Ok(res)
                     }
                     Err(e) => {
                         let consecutive_failures =
                             this.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+
+                        tracing::error!(consecutive_failures, "layer file download failed: {e:#}");
 
                         let backoff = utils::backoff::exponential_backoff_duration_seconds(
                             consecutive_failures.min(u32::MAX as usize) as u32,
@@ -906,9 +915,9 @@ impl LayerInner {
                     }
                 };
 
-                if let Err(res) = tx.send((result, permit)) {
+                if let Err(res) = tx.send(result) {
                     match res {
-                        (Ok(()), _) => {
+                        Ok(_res) => {
                             // our caller is cancellation safe so this is fine; if someone
                             // else requests the layer, they'll find it already downloaded.
                             //
@@ -918,7 +927,7 @@ impl LayerInner {
                             // layer for eviction? alas, cannot: because only DownloadedLayer will
                             // handle that.
                         },
-                        (Err(e), _) => {
+                        Err(e) => {
                             // our caller is cancellation safe, but we might be racing with
                             // another attempt to initialize. before we have cancellation
                             // token support: these attempts should converge regardless of
@@ -933,35 +942,16 @@ impl LayerInner {
         );
 
         match rx.await {
-            Ok((Ok(()), permit)) => {
-                if let Some(reason) = self
-                    .needs_download()
-                    .await
-                    .map_err(DownloadError::PostStatFailed)?
-                {
-                    // this is really a bug in needs_download or remote timeline client
-                    panic!("post-condition failed: needs_download returned {reason:?}");
-                }
-
-                self.consecutive_failures.store(0, Ordering::Relaxed);
-                tracing::info!(size=%self.desc.file_size, "on-demand download successful");
-
-                Ok(permit)
-            }
-            Ok((Err(e), _permit)) => {
+            Ok(Ok(res)) => Ok(res),
+            Ok(Err(e)) => {
                 // sleep already happened in the spawned task, if it was not cancelled
-                let consecutive_failures = self.consecutive_failures.load(Ordering::Relaxed);
-
                 match e.downcast_ref::<remote_storage::DownloadError>() {
                     // If the download failed due to its cancellation token,
                     // propagate the cancellation error upstream.
                     Some(remote_storage::DownloadError::Cancelled) => {
                         Err(DownloadError::DownloadCancelled)
                     }
-                    _ => {
-                        tracing::error!(consecutive_failures, "layer file download failed: {e:#}");
-                        Err(DownloadError::DownloadFailed)
-                    }
+                    _ => Err(DownloadError::DownloadFailed),
                 }
             }
             Err(_gone) => Err(DownloadError::DownloadCancelled),
