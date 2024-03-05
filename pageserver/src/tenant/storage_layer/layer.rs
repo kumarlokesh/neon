@@ -769,40 +769,58 @@ impl LayerInner {
                 .await
                 .map_err(DownloadError::PreStatFailed)?;
 
-            let permit = if let Some(reason) = needs_download {
-                if let NeedsDownload::NotFile(ft) = reason {
-                    return Err(DownloadError::NotFile(ft));
-                }
-
-                // only reset this after we've decided we really need to download. otherwise it'd
-                // be impossible to mark cancelled downloads for eviction, like one could imagine
-                // we would like to do for prefetching which was not needed.
-                self.wanted_evicted.store(false, Ordering::Release);
-
-                if !can_ever_evict {
-                    return Err(DownloadError::NoRemoteStorage);
-                }
-
-                if let Some(ctx) = ctx {
-                    self.check_expected_download(ctx)?;
-                }
-
-                if !allow_download {
-                    // this does look weird, but for LayerInner the "downloading" means also changing
-                    // internal once related state ...
-                    return Err(DownloadError::DownloadRequired);
-                }
-
-                tracing::info!(%reason, "downloading on-demand");
-
-                self.spawn_download_and_wait(timeline, permit).await?
-            } else {
+            let Some(reason) = needs_download else {
                 // the file is present locally, probably by a previous but cancelled call to
                 // get_or_maybe_download. alternatively we might be running without remote storage.
                 LAYER_IMPL_METRICS.inc_init_needed_no_download();
 
-                permit
+                let res = Arc::new(DownloadedLayer {
+                    owner: Arc::downgrade(self),
+                    kind: tokio::sync::OnceCell::default(),
+                    version: next_version,
+                });
+
+                self.access_stats.record_residence_event(
+                    LayerResidenceStatus::Resident,
+                    LayerResidenceEventReason::ResidenceChange,
+                );
+
+                let waiters = self.inner.initializer_count();
+                if waiters > 0 {
+                    tracing::info!(waiters, "completing the on-demand download for other tasks");
+                }
+
+                scopeguard::ScopeGuard::into_inner(init_cancelled);
+
+                return Ok((ResidentOrWantedEvicted::Resident(res), permit));
             };
+
+            if let NeedsDownload::NotFile(ft) = reason {
+                return Err(DownloadError::NotFile(ft));
+            }
+
+            // only reset this after we've decided we really need to download. otherwise it'd
+            // be impossible to mark cancelled downloads for eviction, like one could imagine
+            // we would like to do for prefetching which was not needed.
+            self.wanted_evicted.store(false, Ordering::Release);
+
+            if !can_ever_evict {
+                return Err(DownloadError::NoRemoteStorage);
+            }
+
+            if let Some(ctx) = ctx {
+                self.check_expected_download(ctx)?;
+            }
+
+            if !allow_download {
+                // this does look weird, but for LayerInner the "downloading" means also changing
+                // internal once related state ...
+                return Err(DownloadError::DownloadRequired);
+            }
+
+            tracing::info!(%reason, "downloading on-demand");
+
+            let permit = self.spawn_download_and_wait(timeline, permit).await?;
 
             let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
             if let Some(since_last_eviction) = since_last_eviction {
@@ -837,7 +855,7 @@ impl LayerInner {
         let (strong, _upgraded) = guard
             .get_and_upgrade()
             .expect("init creates strong reference, we held the init permit");
-        return Ok(strong);
+        Ok(strong)
     }
 
     /// Nag or fail per RequestContext policy
