@@ -871,20 +871,10 @@ impl LayerInner {
                     match res {
                         Ok(_res) => {
                             // our caller is cancellation safe so this is fine; if someone
-                            // else requests the layer, they'll find it already downloaded.
-                            //
-                            // See counter [`LayerImplMetrics::inc_init_needed_no_download`]
-                            //
-                            // FIXME(#6028): however, could be that we should consider marking the
-                            // layer for eviction? alas, cannot: because only DownloadedLayer will
-                            // handle that.
+                            // else requests the layer, they'll find it already initialized.
                         },
                         Err(e) => {
-                            // our caller is cancellation safe, but we might be racing with
-                            // another attempt to initialize. before we have cancellation
-                            // token support: these attempts should converge regardless of
-                            // their completion order.
-                            tracing::error!("layer file download failed, and additionally failed to communicate this to caller: {e:?}");
+                            tracing::info!("layer file download failed, and additionally failed to communicate this to caller: {e:?}");
                             LAYER_IMPL_METRICS.inc_download_failed_without_requester();
                         }
                     }
