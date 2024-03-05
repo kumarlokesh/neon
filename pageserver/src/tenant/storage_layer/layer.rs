@@ -32,6 +32,9 @@ use utils::generation::Generation;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod failpoints;
+
 /// A Layer contains all data in a "rectangle" consisting of a range of keys and
 /// range of LSNs.
 ///
@@ -494,6 +497,9 @@ struct LayerInner {
     /// When was the layer last evicted? Reset on initialization so that we'll never accidentially
     /// double count.
     last_evicted_at: std::sync::Mutex<Option<std::time::Instant>>,
+
+    #[cfg(test)]
+    failpoints: std::sync::Mutex<enumset::EnumSet<failpoints::FailpointKind>>,
 }
 
 impl std::fmt::Display for LayerInner {
@@ -632,6 +638,8 @@ impl LayerInner {
             generation,
             shard,
             last_evicted_at: std::sync::Mutex::default(),
+            #[cfg(test)]
+            failpoints: Default::default(),
         }
     }
 
@@ -1254,6 +1262,10 @@ pub(crate) enum DownloadError {
     PreStatFailed(#[source] std::io::Error),
     #[error("post-condition: stat after download failed")]
     PostStatFailed(#[source] std::io::Error),
+
+    #[cfg(test)]
+    #[error("failpoint: {0:?}")]
+    Failpoint(failpoints::FailpointKind),
 }
 
 #[derive(Debug, PartialEq)]
