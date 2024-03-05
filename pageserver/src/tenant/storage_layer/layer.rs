@@ -756,51 +756,51 @@ impl LayerInner {
             );
         }
 
+        let timeline = self
+            .timeline
+            .upgrade()
+            .ok_or_else(|| DownloadError::TimelineShutdown)?;
+
+        // FIXME: grab a gate
+
+        // check if we really need to be downloaded; could have been already downloaded by a
+        // cancelled previous attempt.
+        let needs_download = self
+            .needs_download()
+            .await
+            .map_err(DownloadError::PreStatFailed)?;
+
+        let Some(reason) = needs_download else {
+            #[cfg(test)]
+            self.failpoint(failpoints::FailpointKind::AfterDeterminingLayerNeedsNoDownload)?;
+
+            // the file is present locally, probably by a previous but cancelled call to
+            // get_or_maybe_download. alternatively we might be running without remote storage.
+            LAYER_IMPL_METRICS.inc_init_needed_no_download();
+
+            let res = self.initialize_after_layer_is_on_disk(permit);
+            return Ok(res);
+        };
+
+        if let NeedsDownload::NotFile(ft) = reason {
+            return Err(DownloadError::NotFile(ft));
+        }
+
+        if timeline.remote_client.as_ref().is_none() {
+            return Err(DownloadError::NoRemoteStorage);
+        }
+
+        if let Some(ctx) = ctx {
+            self.check_expected_download(ctx)?;
+        }
+
+        if !allow_download {
+            // this does look weird, but for LayerInner the "downloading" means also changing
+            // internal once related state ...
+            return Err(DownloadError::DownloadRequired);
+        }
+
         async move {
-            let timeline = self
-                .timeline
-                .upgrade()
-                .ok_or_else(|| DownloadError::TimelineShutdown)?;
-
-            // FIXME: grab a gate
-
-            // check if we really need to be downloaded; could have been already downloaded by a
-            // cancelled previous attempt.
-            let needs_download = self
-                .needs_download()
-                .await
-                .map_err(DownloadError::PreStatFailed)?;
-
-            let Some(reason) = needs_download else {
-                #[cfg(test)]
-                self.failpoint(failpoints::FailpointKind::AfterDeterminingLayerNeedsNoDownload)?;
-
-                // the file is present locally, probably by a previous but cancelled call to
-                // get_or_maybe_download. alternatively we might be running without remote storage.
-                LAYER_IMPL_METRICS.inc_init_needed_no_download();
-
-                let res = self.initialize_after_layer_is_on_disk(permit);
-                return Ok(res);
-            };
-
-            if let NeedsDownload::NotFile(ft) = reason {
-                return Err(DownloadError::NotFile(ft));
-            }
-
-            if timeline.remote_client.as_ref().is_none() {
-                return Err(DownloadError::NoRemoteStorage);
-            }
-
-            if let Some(ctx) = ctx {
-                self.check_expected_download(ctx)?;
-            }
-
-            if !allow_download {
-                // this does look weird, but for LayerInner the "downloading" means also changing
-                // internal once related state ...
-                return Err(DownloadError::DownloadRequired);
-            }
-
             tracing::info!(%reason, "downloading on-demand");
 
             let init_cancelled = scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
