@@ -491,6 +491,8 @@ struct LayerInner {
     /// a shard split since the layer was originally written.
     shard: ShardIndex,
 
+    /// When was the layer last evicted? Reset on initialization so that we'll never accidentially
+    /// double count.
     last_evicted_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
@@ -971,10 +973,13 @@ impl LayerInner {
         // no need to make the evict_and_wait wait for the actual download to complete
         drop(self.status.send(Status::Downloaded));
 
-        let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
+        let since_last_eviction = self
+            .last_evicted_at
+            .lock()
+            .unwrap()
+            .take()
+            .map(|ts| ts.elapsed());
         if let Some(since_last_eviction) = since_last_eviction {
-            // FIXME: this will not always be recorded correctly until #6028 (the no
-            // download needed branch above)
             LAYER_IMPL_METRICS.record_redownloaded_after(since_last_eviction);
         }
 
