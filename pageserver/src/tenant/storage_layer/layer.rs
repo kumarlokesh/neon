@@ -773,6 +773,7 @@ impl LayerInner {
                 // the file is present locally, probably by a previous but cancelled call to
                 // get_or_maybe_download. alternatively we might be running without remote storage.
                 LAYER_IMPL_METRICS.inc_init_needed_no_download();
+                scopeguard::ScopeGuard::into_inner(init_cancelled);
 
                 let res = Arc::new(DownloadedLayer {
                     owner: Arc::downgrade(self),
@@ -789,8 +790,6 @@ impl LayerInner {
                 if waiters > 0 {
                     tracing::info!(waiters, "completing the on-demand download for other tasks");
                 }
-
-                scopeguard::ScopeGuard::into_inner(init_cancelled);
 
                 let value = ResidentOrWantedEvicted::Resident(res.clone());
 
@@ -825,6 +824,7 @@ impl LayerInner {
             tracing::info!(%reason, "downloading on-demand");
 
             let permit = self.spawn_download_and_wait(timeline, permit).await?;
+            scopeguard::ScopeGuard::into_inner(init_cancelled);
 
             let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
             if let Some(since_last_eviction) = since_last_eviction {
@@ -848,8 +848,6 @@ impl LayerInner {
             if waiters > 0 {
                 tracing::info!(waiters, "completing the on-demand download for other tasks");
             }
-
-            scopeguard::ScopeGuard::into_inner(init_cancelled);
 
             let value = ResidentOrWantedEvicted::Resident(res.clone());
 
