@@ -775,26 +775,7 @@ impl LayerInner {
                 LAYER_IMPL_METRICS.inc_init_needed_no_download();
                 scopeguard::ScopeGuard::into_inner(init_cancelled);
 
-                let res = Arc::new(DownloadedLayer {
-                    owner: Arc::downgrade(self),
-                    kind: tokio::sync::OnceCell::default(),
-                    version: next_version,
-                });
-
-                self.access_stats.record_residence_event(
-                    LayerResidenceStatus::Resident,
-                    LayerResidenceEventReason::ResidenceChange,
-                );
-
-                let waiters = self.inner.initializer_count();
-                if waiters > 0 {
-                    tracing::info!(waiters, "completing the on-demand download for other tasks");
-                }
-
-                let value = ResidentOrWantedEvicted::Resident(res.clone());
-
-                self.inner.set(value, permit);
-
+                let res = self.initialize_after_layer_is_on_disk(next_version, permit);
                 return Ok(res);
             };
 
@@ -826,32 +807,7 @@ impl LayerInner {
             let permit = self.spawn_download_and_wait(timeline, permit).await?;
             scopeguard::ScopeGuard::into_inner(init_cancelled);
 
-            let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
-            if let Some(since_last_eviction) = since_last_eviction {
-                // FIXME: this will not always be recorded correctly until #6028 (the no
-                // download needed branch above)
-                LAYER_IMPL_METRICS.record_redownloaded_after(since_last_eviction);
-            }
-
-            let res = Arc::new(DownloadedLayer {
-                owner: Arc::downgrade(self),
-                kind: tokio::sync::OnceCell::default(),
-                version: next_version,
-            });
-
-            self.access_stats.record_residence_event(
-                LayerResidenceStatus::Resident,
-                LayerResidenceEventReason::ResidenceChange,
-            );
-
-            let waiters = self.inner.initializer_count();
-            if waiters > 0 {
-                tracing::info!(waiters, "completing the on-demand download for other tasks");
-            }
-
-            let value = ResidentOrWantedEvicted::Resident(res.clone());
-
-            self.inner.set(value, permit);
+            let res = self.initialize_after_layer_is_on_disk(next_version, permit);
 
             Ok(res)
         }
@@ -1004,6 +960,43 @@ impl LayerInner {
             }
             Err(_gone) => Err(DownloadError::DownloadCancelled),
         }
+    }
+
+    fn initialize_after_layer_is_on_disk(
+        self: &Arc<LayerInner>,
+        next_version: usize,
+        permit: heavier_once_cell::InitPermit,
+    ) -> Arc<DownloadedLayer> {
+        debug_assert_current_span_has_tenant_and_timeline_id();
+
+        let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
+        if let Some(since_last_eviction) = since_last_eviction {
+            // FIXME: this will not always be recorded correctly until #6028 (the no
+            // download needed branch above)
+            LAYER_IMPL_METRICS.record_redownloaded_after(since_last_eviction);
+        }
+
+        let res = Arc::new(DownloadedLayer {
+            owner: Arc::downgrade(self),
+            kind: tokio::sync::OnceCell::default(),
+            version: next_version,
+        });
+
+        self.access_stats.record_residence_event(
+            LayerResidenceStatus::Resident,
+            LayerResidenceEventReason::ResidenceChange,
+        );
+
+        let waiters = self.inner.initializer_count();
+        if waiters > 0 {
+            tracing::info!(waiters, "completing the on-demand download for other tasks");
+        }
+
+        let value = ResidentOrWantedEvicted::Resident(res.clone());
+
+        self.inner.set(value, permit);
+
+        res
     }
 
     async fn needs_download(&self) -> Result<Option<NeedsDownload>, std::io::Error> {
