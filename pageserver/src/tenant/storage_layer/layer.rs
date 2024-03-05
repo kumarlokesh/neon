@@ -814,10 +814,14 @@ impl LayerInner {
             }
 
             let (weak, permit) = {
-                let mut locked = self.inner.get_or_init(download).await?;
+                let locked = self
+                    .inner
+                    .get_or_init_detached()
+                    .await
+                    .map(|mut guard| guard.get_and_upgrade().ok_or(guard));
 
-                if let Some((strong, upgraded)) = locked.get_and_upgrade() {
-                    if upgraded {
+                match locked {
+                    Ok(Ok((strong, upgraded))) if upgraded => {
                         // when upgraded back, the Arc<DownloadedLayer> is still available, but
                         // previously a `evict_and_wait` was received.
                         self.wanted_evicted.store(false, Ordering::Relaxed);
@@ -826,29 +830,31 @@ impl LayerInner {
                         drop(self.status.send(Status::Downloaded));
                         LAYER_IMPL_METRICS
                             .inc_eviction_cancelled(EvictionCancelled::UpgradedBackOnAccess);
-                    }
 
-                    return Ok(strong);
-                } else {
-                    // path to here: the evict_blocking is stuck on spawn_blocking queue.
-                    //
-                    // reset the contents, deactivating the eviction and causing a
-                    // EvictionCancelled::LostToDownload or EvictionCancelled::VersionCheckFailed.
-                    locked.take_and_deinit()
+                        return Ok(strong);
+                    }
+                    Ok(Ok((strong, _))) => return Ok(strong),
+                    Ok(Err(mut guard)) => {
+                        // path to here: the evict_blocking is stuck on spawn_blocking queue.
+                        //
+                        // reset the contents, deactivating the eviction and causing a
+                        // EvictionCancelled::LostToDownload or EvictionCancelled::VersionCheckFailed.
+                        let (weak, permit) = guard.take_and_deinit();
+                        (Some(weak), permit)
+                    }
+                    Err(permit) => (None, permit),
                 }
             };
 
-            // unlock first, then drop the weak, but because upgrade failed, we
-            // know it cannot be a problem.
-
-            assert!(
-                matches!(weak, ResidentOrWantedEvicted::WantedEvicted(..)),
-                "unexpected {weak:?}, ResidentOrWantedEvicted::get_and_upgrade has a bug"
-            );
+            if let Some(weak) = weak {
+                // only drop the weak after dropping the heavier_once_cell guard
+                assert!(
+                    matches!(weak, ResidentOrWantedEvicted::WantedEvicted(..)),
+                    "unexpected {weak:?}, ResidentOrWantedEvicted::get_and_upgrade has a bug"
+                );
+            }
 
             init_permit = Some(permit);
-
-            LAYER_IMPL_METRICS.inc_retried_get_or_maybe_download();
         }
     }
 
@@ -1663,11 +1669,6 @@ impl LayerImplMetrics {
         self.rare_counters[RareEvent::RemoveOnDropFailed].inc();
     }
 
-    /// Expected rare because requires a race with `evict_blocking` and `get_or_maybe_download`.
-    fn inc_retried_get_or_maybe_download(&self) {
-        self.rare_counters[RareEvent::RetriedGetOrMaybeDownload].inc();
-    }
-
     /// Expected rare because cancellations are unexpected, and failures are unexpected
     fn inc_download_failed_without_requester(&self) {
         self.rare_counters[RareEvent::DownloadFailedWithoutRequester].inc();
@@ -1752,7 +1753,6 @@ impl DeleteFailed {
 #[derive(enum_map::Enum)]
 enum RareEvent {
     RemoveOnDropFailed,
-    RetriedGetOrMaybeDownload,
     DownloadFailedWithoutRequester,
     UpgradedWantedEvicted,
     InitWithoutDownload,
@@ -1766,7 +1766,6 @@ impl RareEvent {
 
         match self {
             RemoveOnDropFailed => "remove_on_drop_failed",
-            RetriedGetOrMaybeDownload => "retried_gomd",
             DownloadFailedWithoutRequester => "download_failed_without",
             UpgradedWantedEvicted => "raced_wanted_evicted",
             InitWithoutDownload => "init_needed_no_download",
