@@ -745,9 +745,6 @@ impl LayerInner {
         }
 
         async move {
-            // count cancellations, which currently remain largely unexpected
-            let init_cancelled = scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
-
             let timeline = self
                 .timeline
                 .upgrade()
@@ -766,7 +763,6 @@ impl LayerInner {
                 // the file is present locally, probably by a previous but cancelled call to
                 // get_or_maybe_download. alternatively we might be running without remote storage.
                 LAYER_IMPL_METRICS.inc_init_needed_no_download();
-                scopeguard::ScopeGuard::into_inner(init_cancelled);
 
                 let res = self.initialize_after_layer_is_on_disk(permit);
                 return Ok(res);
@@ -792,6 +788,7 @@ impl LayerInner {
 
             tracing::info!(%reason, "downloading on-demand");
 
+            let init_cancelled = scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
             let permit = self.spawn_download_and_wait(timeline, permit).await?;
             scopeguard::ScopeGuard::into_inner(init_cancelled);
 
