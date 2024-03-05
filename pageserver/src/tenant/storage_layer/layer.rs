@@ -511,6 +511,7 @@ impl AsLayerDesc for LayerInner {
 #[derive(Debug, Clone, Copy)]
 enum Status {
     Evicted,
+    Downloading,
     Downloaded,
 }
 
@@ -677,6 +678,7 @@ impl LayerInner {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Ok(Status::Evicted)) => Ok(()),
+            Ok(Ok(Status::Downloading)) => Err(EvictionError::Downloaded),
             Ok(Ok(Status::Downloaded)) => Err(EvictionError::Downloaded),
             Ok(Err(RecvError::Closed)) => {
                 unreachable!("sender cannot be dropped while we are in &self method")
@@ -848,6 +850,12 @@ impl LayerInner {
         tokio::task::spawn(async move {
 
                 let _guard = guard;
+
+                // now that we have commited to downloading, send out an update
+                // FIXME: this still has the problem that Layer::keep_resident might happen begin
+                // right after this, but not get the message -- a watch channel might work, but is
+                // it more expensive?
+                drop(this.status.send(Status::Downloading));
 
                 let client = timeline
                     .remote_client
