@@ -702,146 +702,142 @@ impl LayerInner {
         allow_download: bool,
         ctx: Option<&RequestContext>,
     ) -> Result<Arc<DownloadedLayer>, DownloadError> {
-        loop {
-            let (weak, permit) = {
-                let locked = self
-                    .inner
-                    .get_or_init_detached()
-                    .await
-                    .map(|mut guard| guard.get_and_upgrade().ok_or(guard));
+        let (weak, permit) = {
+            let locked = self
+                .inner
+                .get_or_init_detached()
+                .await
+                .map(|mut guard| guard.get_and_upgrade().ok_or(guard));
 
-                match locked {
-                    Ok(Ok((strong, upgraded))) if upgraded => {
-                        // when upgraded back, the Arc<DownloadedLayer> is still available, but
-                        // previously a `evict_and_wait` was received.
-                        self.wanted_evicted.store(false, Ordering::Relaxed);
+            match locked {
+                Ok(Ok((strong, upgraded))) if upgraded => {
+                    // when upgraded back, the Arc<DownloadedLayer> is still available, but
+                    // previously a `evict_and_wait` was received.
+                    self.wanted_evicted.store(false, Ordering::Relaxed);
 
-                        // error out any `evict_and_wait`
-                        drop(self.status.send(Status::Downloaded));
-                        LAYER_IMPL_METRICS
-                            .inc_eviction_cancelled(EvictionCancelled::UpgradedBackOnAccess);
+                    // error out any `evict_and_wait`
+                    drop(self.status.send(Status::Downloaded));
+                    LAYER_IMPL_METRICS
+                        .inc_eviction_cancelled(EvictionCancelled::UpgradedBackOnAccess);
 
-                        return Ok(strong);
-                    }
-                    Ok(Ok((strong, _))) => return Ok(strong),
-                    Ok(Err(mut guard)) => {
-                        // path to here: the evict_blocking is stuck on spawn_blocking queue.
-                        //
-                        // reset the contents, deactivating the eviction and causing a
-                        // EvictionCancelled::LostToDownload or EvictionCancelled::VersionCheckFailed.
-                        let (weak, permit) = guard.take_and_deinit();
-                        (Some(weak), permit)
-                    }
-                    Err(permit) => (None, permit),
+                    return Ok(strong);
                 }
+                Ok(Ok((strong, _))) => return Ok(strong),
+                Ok(Err(mut guard)) => {
+                    // path to here: the evict_blocking is stuck on spawn_blocking queue.
+                    //
+                    // reset the contents, deactivating the eviction and causing a
+                    // EvictionCancelled::LostToDownload or EvictionCancelled::VersionCheckFailed.
+                    let (weak, permit) = guard.take_and_deinit();
+                    (Some(weak), permit)
+                }
+                Err(permit) => (None, permit),
+            }
+        };
+
+        if let Some(weak) = weak {
+            // only drop the weak after dropping the heavier_once_cell guard
+            assert!(
+                matches!(weak, ResidentOrWantedEvicted::WantedEvicted(..)),
+                "unexpected {weak:?}, ResidentOrWantedEvicted::get_and_upgrade has a bug"
+            );
+        }
+
+        let (value, permit) = async move {
+            // disable any scheduled but not yet running eviction deletions for this
+            let next_version = 1 + self.version.fetch_add(1, Ordering::Relaxed);
+
+            // count cancellations, which currently remain largely unexpected
+            let init_cancelled = scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
+
+            // no need to make the evict_and_wait wait for the actual download to complete
+            drop(self.status.send(Status::Downloaded));
+
+            let timeline = self
+                .timeline
+                .upgrade()
+                .ok_or_else(|| DownloadError::TimelineShutdown)?;
+
+            // FIXME: grab a gate
+
+            let can_ever_evict = timeline.remote_client.as_ref().is_some();
+
+            // check if we really need to be downloaded; could have been already downloaded by a
+            // cancelled previous attempt.
+            let needs_download = self
+                .needs_download()
+                .await
+                .map_err(DownloadError::PreStatFailed)?;
+
+            let permit = if let Some(reason) = needs_download {
+                if let NeedsDownload::NotFile(ft) = reason {
+                    return Err(DownloadError::NotFile(ft));
+                }
+
+                // only reset this after we've decided we really need to download. otherwise it'd
+                // be impossible to mark cancelled downloads for eviction, like one could imagine
+                // we would like to do for prefetching which was not needed.
+                self.wanted_evicted.store(false, Ordering::Release);
+
+                if !can_ever_evict {
+                    return Err(DownloadError::NoRemoteStorage);
+                }
+
+                if let Some(ctx) = ctx {
+                    self.check_expected_download(ctx)?;
+                }
+
+                if !allow_download {
+                    // this does look weird, but for LayerInner the "downloading" means also changing
+                    // internal once related state ...
+                    return Err(DownloadError::DownloadRequired);
+                }
+
+                tracing::info!(%reason, "downloading on-demand");
+
+                self.spawn_download_and_wait(timeline, permit).await?
+            } else {
+                // the file is present locally, probably by a previous but cancelled call to
+                // get_or_maybe_download. alternatively we might be running without remote storage.
+                LAYER_IMPL_METRICS.inc_init_needed_no_download();
+
+                permit
             };
 
-            if let Some(weak) = weak {
-                // only drop the weak after dropping the heavier_once_cell guard
-                assert!(
-                    matches!(weak, ResidentOrWantedEvicted::WantedEvicted(..)),
-                    "unexpected {weak:?}, ResidentOrWantedEvicted::get_and_upgrade has a bug"
-                );
+            let since_last_eviction = self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
+            if let Some(since_last_eviction) = since_last_eviction {
+                // FIXME: this will not always be recorded correctly until #6028 (the no
+                // download needed branch above)
+                LAYER_IMPL_METRICS.record_redownloaded_after(since_last_eviction);
             }
 
-            let (value, permit) = async move {
-                // disable any scheduled but not yet running eviction deletions for this
-                let next_version = 1 + self.version.fetch_add(1, Ordering::Relaxed);
+            let res = Arc::new(DownloadedLayer {
+                owner: Arc::downgrade(self),
+                kind: tokio::sync::OnceCell::default(),
+                version: next_version,
+            });
 
-                // count cancellations, which currently remain largely unexpected
-                let init_cancelled =
-                    scopeguard::guard((), |_| LAYER_IMPL_METRICS.inc_init_cancelled());
+            self.access_stats.record_residence_event(
+                LayerResidenceStatus::Resident,
+                LayerResidenceEventReason::ResidenceChange,
+            );
 
-                // no need to make the evict_and_wait wait for the actual download to complete
-                drop(self.status.send(Status::Downloaded));
-
-                let timeline = self
-                    .timeline
-                    .upgrade()
-                    .ok_or_else(|| DownloadError::TimelineShutdown)?;
-
-                // FIXME: grab a gate
-
-                let can_ever_evict = timeline.remote_client.as_ref().is_some();
-
-                // check if we really need to be downloaded; could have been already downloaded by a
-                // cancelled previous attempt.
-                let needs_download = self
-                    .needs_download()
-                    .await
-                    .map_err(DownloadError::PreStatFailed)?;
-
-                let permit = if let Some(reason) = needs_download {
-                    if let NeedsDownload::NotFile(ft) = reason {
-                        return Err(DownloadError::NotFile(ft));
-                    }
-
-                    // only reset this after we've decided we really need to download. otherwise it'd
-                    // be impossible to mark cancelled downloads for eviction, like one could imagine
-                    // we would like to do for prefetching which was not needed.
-                    self.wanted_evicted.store(false, Ordering::Release);
-
-                    if !can_ever_evict {
-                        return Err(DownloadError::NoRemoteStorage);
-                    }
-
-                    if let Some(ctx) = ctx {
-                        self.check_expected_download(ctx)?;
-                    }
-
-                    if !allow_download {
-                        // this does look weird, but for LayerInner the "downloading" means also changing
-                        // internal once related state ...
-                        return Err(DownloadError::DownloadRequired);
-                    }
-
-                    tracing::info!(%reason, "downloading on-demand");
-
-                    self.spawn_download_and_wait(timeline, permit).await?
-                } else {
-                    // the file is present locally, probably by a previous but cancelled call to
-                    // get_or_maybe_download. alternatively we might be running without remote storage.
-                    LAYER_IMPL_METRICS.inc_init_needed_no_download();
-
-                    permit
-                };
-
-                let since_last_eviction =
-                    self.last_evicted_at.lock().unwrap().map(|ts| ts.elapsed());
-                if let Some(since_last_eviction) = since_last_eviction {
-                    // FIXME: this will not always be recorded correctly until #6028 (the no
-                    // download needed branch above)
-                    LAYER_IMPL_METRICS.record_redownloaded_after(since_last_eviction);
-                }
-
-                let res = Arc::new(DownloadedLayer {
-                    owner: Arc::downgrade(self),
-                    kind: tokio::sync::OnceCell::default(),
-                    version: next_version,
-                });
-
-                self.access_stats.record_residence_event(
-                    LayerResidenceStatus::Resident,
-                    LayerResidenceEventReason::ResidenceChange,
-                );
-
-                let waiters = self.inner.initializer_count();
-                if waiters > 0 {
-                    tracing::info!(waiters, "completing the on-demand download for other tasks");
-                }
-
-                scopeguard::ScopeGuard::into_inner(init_cancelled);
-
-                Ok((ResidentOrWantedEvicted::Resident(res), permit))
+            let waiters = self.inner.initializer_count();
+            if waiters > 0 {
+                tracing::info!(waiters, "completing the on-demand download for other tasks");
             }
-            .instrument(tracing::info_span!("get_or_maybe_download", layer=%self))
-            .await?;
-            let mut guard = self.inner.set(value, permit);
-            let (strong, _upgraded) = guard
-                .get_and_upgrade()
-                .expect("init creates strong reference, we held the init permit");
-            return Ok(strong);
+
+            scopeguard::ScopeGuard::into_inner(init_cancelled);
+
+            Ok((ResidentOrWantedEvicted::Resident(res), permit))
         }
+        .instrument(tracing::info_span!("get_or_maybe_download", layer=%self))
+        .await?;
+        let mut guard = self.inner.set(value, permit);
+        let (strong, _upgraded) = guard
+            .get_and_upgrade()
+            .expect("init creates strong reference, we held the init permit");
+        return Ok(strong);
     }
 
     /// Nag or fail per RequestContext policy
