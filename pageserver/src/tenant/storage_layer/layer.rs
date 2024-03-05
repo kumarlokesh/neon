@@ -761,8 +761,6 @@ impl LayerInner {
 
             // FIXME: grab a gate
 
-            let can_ever_evict = timeline.remote_client.as_ref().is_some();
-
             // check if we really need to be downloaded; could have been already downloaded by a
             // cancelled previous attempt.
             let needs_download = self
@@ -789,7 +787,7 @@ impl LayerInner {
             // we would like to do for prefetching which was not needed.
             self.wanted_evicted.store(false, Ordering::Release);
 
-            if !can_ever_evict {
+            if timeline.remote_client.as_ref().is_none() {
                 return Err(DownloadError::NoRemoteStorage);
             }
 
