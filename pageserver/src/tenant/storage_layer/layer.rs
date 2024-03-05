@@ -962,6 +962,13 @@ impl LayerInner {
         }
     }
 
+    /// Initializes the `Self::inner` to a "resident" state.
+    ///
+    /// Callers are assumed to ensure that the file is actually on disk with `Self::needs_download`
+    /// before calling this method.
+    ///
+    /// If this method is ever made async, it needs to be cancellation safe so that no state
+    /// changes are made before we can write to the OnceCell in non-cancellable fashion.
     fn initialize_after_layer_is_on_disk(
         self: &Arc<LayerInner>,
         next_version: usize,
