@@ -752,7 +752,7 @@ impl LayerInner {
 
                     return Ok(strong);
                 }
-                Ok(Err(mut guard)) => {
+                Ok(Err(guard)) => {
                     // path to here: the evict_blocking is stuck on spawn_blocking queue.
                     //
                     // reset the contents, deactivating the eviction and causing a
@@ -1199,7 +1199,7 @@ impl LayerInner {
             };
 
             let (_weak, permit) = match waited {
-                Ok(mut guard) => {
+                Ok(guard) => {
                     if let ResidentOrWantedEvicted::WantedEvicted(_weak, version) = &*guard {
                         if *version == only_version {
                             let (weak, permit) = guard.take_and_deinit();
