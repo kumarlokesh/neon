@@ -271,6 +271,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-take"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8ab6b55fe97976e46f91ddbed8d147d966475dc29b2032757ba47e02376fbc3"
+
+[[package]]
 name = "attachment_service"
 version = "0.1.0"
 dependencies = [
@@ -4244,6 +4250,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomic-take",
  "base64 0.13.1",
  "bstr",
  "bytes",
@@ -7158,7 +7165,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-core",
- "tungstenite 0.20.1",
  "url",
  "uuid",
  "zeroize",
