@@ -952,7 +952,7 @@ impl LayerInner {
             }
             Err(e) => {
                 let consecutive_failures =
-                    self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+                    1 + self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
 
                 tracing::error!(consecutive_failures, "layer file download failed: {e:#}");
 
