@@ -43,6 +43,7 @@ use utils::sync::gate::Gate;
 use utils::sync::gate::GateGuard;
 use utils::timeout::timeout_cancellable;
 use utils::timeout::TimeoutCancellableError;
+use utils::zstd;
 
 use self::config::AttachedLocationConfig;
 use self::config::AttachmentMode;
@@ -3046,8 +3047,7 @@ impl Tenant {
             }
         }
 
-        let (pgdata_zstd, tar_zst_size) =
-            import_datadir::create_tar_zst(pgdata_path, &temp_path).await?;
+        let (pgdata_zstd, tar_zst_size) = zstd::create_tarball(pgdata_path, &temp_path).await?;
 
         pausable_failpoint!("before-initdb-upload");
 
@@ -3146,7 +3146,7 @@ impl Tenant {
 
             let buf_read =
                 BufReader::with_capacity(remote_timeline_client::BUFFER_SIZE, initdb_tar_zst);
-            import_datadir::extract_tar_zst(&pgdata_path, buf_read)
+            zstd::extract_tarball(&pgdata_path, buf_read)
                 .await
                 .context("extract initdb tar")?;
         } else {
