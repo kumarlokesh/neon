@@ -650,14 +650,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> WalSender<'_, IO> {
     /// - Err in case of error -- only if 1) term changed while fetching in recovery
     ///   mode 2) watch channel closed, which must never happen.
     async fn wait_for_lsn(&mut self) -> anyhow::Result<Option<Lsn>> {
-        fail::fail_point!(
-            "sk-pause-send",
-            self.appname.as_deref() != Some("pageserver"),
-            |_| {
-                tokio::time::sleep(POLL_STATE_TIMEOUT);
-                Ok(None)
-            }
-        );
+        let fp = (|| {
+            fail::fail_point!(
+                "sk-pause-send",
+                self.appname.as_deref() != Some("pageserver"),
+                |_| { true }
+            );
+            false
+        })();
+        if fp {
+            tokio::time::sleep(POLL_STATE_TIMEOUT).await;
+            return Ok(None);
+        }
 
         let res = timeout(POLL_STATE_TIMEOUT, async move {
             loop {

@@ -268,6 +268,44 @@ LogicalSlotsMonitorMain(Datum main_arg)
 	}
 }
 
+static NeonWALReader *wal_reader = NULL;
+void NeonWALPageRead(
+    XLogReaderState *xlogreader,
+    XLogRecPtr targetPagePtr,
+    int reqLen,
+    XLogRecPtr targetRecPtr,
+    char *readBuf)
+{
+	NeonWALReadResult res = NeonWALRead(
+            wal_reader,
+            readBuf,
+            targetPagePtr,
+            reqLen,
+            walprop_pg_get_timleine_id());
+        // TODO: Handle WOULDBLOCK
+	return res;
+}
+
+void NeonWALReadSegmentOpen(XLogReaderState *xlogreader, XLogSegNo nextSegNo, TimelineID *tli_p)
+{
+    neon_wal_segment_open(wal_reader, nextSegNo, tli_p);
+}
+
+void NeonWALReadSegmentClose(XLogReaderState *xlogreader)
+{
+    neon_wal_segment_close(wal_reader);
+}
+
+void NeonOnDemandXLogReaderRoutines(XLogReaderRoutine *xlr)
+{
+    if(!wal_reader)
+    {
+        wal_reader = NeonWALReaderAllocate(wal_segment_size, GetWalpropShmemState()->commitLsn, "walsender");
+    }
+    xlr->page_read = NeonWALPageRead;
+    xlr->segment_open = NeonWALReadSegmentOpen;
+    xlr->segment_close = NeonWALReadSegmentClose;
+}
 
 void
 _PG_init(void)
@@ -282,6 +320,7 @@ _PG_init(void)
 
 	pg_init_libpagestore();
 	pg_init_walproposer();
+        WalSender_Custom_XLogReaderRoutines = NeonOnDemandXLogReaderRoutines;
 
 	InitLogicalReplicationMonitor();
 
